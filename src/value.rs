@@ -1,11 +1,15 @@
+//! Symolic move values.
+
 use std::ops::{BitAnd, BitOr, BitXor, Add, Mul, Div, Rem};
 use z3::{Context, ast::{Bool, BV, Ast}};
 use move_stackless_bytecode::{
   stackless_bytecode::{Constant},
 };
 
+/// The type of formulae, i.e., terms of boolean sort.
 pub type Constraint<'ctx> = Bool<'ctx>;
 
+/// The type of move values.
 pub enum Type {
   Bool,
   U8,
@@ -14,6 +18,7 @@ pub enum Type {
   U256
 }
 
+/// Symbolic move values.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Value<'ctx> {
   Bool(Bool<'ctx>),
@@ -116,6 +121,7 @@ impl<'ctx> BitXor<Self> for Value<'ctx> {
 }
 
 impl<'ctx> Value<'ctx> {
+  /// Injection from closed values.
   pub fn from_constant(c: &Constant, context: &'ctx Context) -> Self {
     match c {
       Constant::Bool(b) => Value::Bool(Bool::from_bool(context, *b)),
@@ -125,6 +131,7 @@ impl<'ctx> Value<'ctx> {
     }
   }
 
+  /// Construct a fresh value of type `t`.
   pub fn from_type(t: &Type, context: &'ctx Context) -> Self {
     match t {
       Type::Bool => Value::Bool(Bool::fresh_const(context, "")),
@@ -212,12 +219,21 @@ impl<'ctx> Value<'ctx> {
   }
 }
 
+/// The product of `Value` and `Constraint`.
 #[derive(Clone, Debug)]
 pub struct ConstrainedValue<'ctx> {
   value: Value<'ctx>,
   constraint: Constraint<'ctx>,
 }
 
+use std::fmt;
+impl<'ctx> fmt::Display for ConstrainedValue<'ctx> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(f, "({:?}, {:?})", self.value, self.constraint)
+  }
+}
+
+/// Impose another constraint.
 impl<'ctx> BitAnd<Bool<'ctx>> for ConstrainedValue<'ctx> {
   type Output = Self;
 
@@ -234,6 +250,7 @@ impl<'ctx> ConstrainedValue<'ctx> {
     Self { value, constraint }
   }
 
+  /// Simplify the constraint.
   pub fn simplify(self) -> Self {
     Self {
       constraint: self.constraint.simplify(),
@@ -241,7 +258,7 @@ impl<'ctx> ConstrainedValue<'ctx> {
     }
   }
 
-  /// A new symbolic value of type `t` constrained by true.
+  /// Construct a new symbolic value of type `t` constrained by true.
   pub fn from_type(t: &Type, context: &'ctx Context) -> Self {
     Self { value: Value::from_type(t, context), constraint: Bool::from_bool(context, true) }
   }
@@ -250,7 +267,8 @@ impl<'ctx> ConstrainedValue<'ctx> {
     (self.value, self.constraint)
   }
 
-  /// Turn a constrained boolean value to a constraint.
+  /// Turn a constrained boolean value to a constraint,
+  /// which is the conjunction of the value and the constraint.
   pub fn to_constraint(self) -> Constraint<'ctx> {
     match self {
       ConstrainedValue { value: Value::Bool(b), constraint } => b & constraint,
@@ -258,7 +276,8 @@ impl<'ctx> ConstrainedValue<'ctx> {
     }
   }
 
-  /// Return a single merged value if `self` and `other` has identical values.
+  /// Return a single merged value if `self` and `other` have identical values,
+  /// otherwise a union of `self` and `other`.
   pub fn merge(self, other: Self) -> Vec<Self> {
     if self.value == other.value {
       vec![Self::new(self.value, (self.constraint | other.constraint).simplify())]

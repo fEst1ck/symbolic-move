@@ -2,6 +2,9 @@
 
 use crate::traits::{State, Transition, StateSet};
 
+/// Evaluate from initial state `init_state` using the
+/// `pickNext` as the search strategy, report all
+/// successing final states.
 pub fn eval<T, S, F, G>(init_state: T, pick_next: F, report: G)
   where 
     T: State + Transition + std::fmt::Debug,
@@ -17,7 +20,6 @@ pub fn eval<T, S, F, G>(init_state: T, pick_next: F, report: G)
       if s.is_final() {
         report(s);
       } else {
-        println!("{:?}", &s);
         frontier.insert(s);
       }
     }
