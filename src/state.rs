@@ -1,5 +1,5 @@
 //! # Evaluation State
-use crate::value::{ConstrainedValue, Constraint, Type, Value};
+use crate::value::{ConstrainedValue, Constraint, Value, Type};
 use move_stackless_bytecode::{
   stackless_bytecode::{Bytecode, Label},
 };
@@ -410,22 +410,30 @@ mod eval {
       // CastU8 => todo!
       // CastU64 => todo!
       // CastU128 => todo!
-      // Not => todo!
+      Not => pure_operation(
+        dsts,
+        |x: Vec<Value>| {
+          assert_eq!(x.len(), 1);
+          vec![!x.index(0)]
+        },
+        srcs,
+        s
+      ),
       // Binary
       Add => pure_operation(
         dsts,
         |x: Vec<Value>| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone() + x[1].clone()]
+          vec![x.index(0) + x.index(1)]
         },
         srcs,
-        s,
+        s
       ),
       Mul => pure_operation(
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone() * x[1].clone()]
+          vec![x.index(0) * x.index(1)]
         },
         srcs,
         s,
@@ -434,7 +442,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone() / x[1].clone()]
+          vec![x.index(0) / x.index(1)]
         },
         srcs,
         s,
@@ -443,7 +451,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone() % x[1].clone()]
+          vec![x.index(0) % x.index(1)]
         },
         srcs,
         s,
@@ -452,7 +460,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone() | x[1].clone()]
+          vec![x.index(0) | x.index(1)]
         },
         srcs,
         s,
@@ -461,7 +469,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone() & x[1].clone()]
+          vec![x.index(0) & x.index(1)]
         },
         srcs,
         s,
@@ -470,7 +478,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone() ^ x[1].clone()]
+          vec![x.index(0) ^ x.index(1)]
         },
         srcs,
         s,
@@ -481,7 +489,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone().lt(x[1].clone())]
+          vec![x[0].lt(&x[1])]
         },
         srcs,
         s,
@@ -490,7 +498,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone().gt(x[1].clone())]
+          vec![x[0].gt(&x[1])]
         },
         srcs,
         s,
@@ -499,7 +507,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone().le(x[1].clone())]
+          vec![x[0].le(&x[1])]
         },
         srcs,
         s,
@@ -508,7 +516,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone().ge(x[1].clone())]
+          vec![x[0].ge(&x[1])]
         },
         srcs,
         s,
@@ -517,7 +525,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone().or(x[1].clone())]
+          vec![x[0].or(&x[1])]
         },
         srcs,
         s,
@@ -526,7 +534,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone().and(x[1].clone())]
+          vec![x[0].and(&x[1])]
         },
         srcs,
         s,
@@ -535,7 +543,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone().eq(x[1].clone())]
+          vec![x[0].eq(&x[1])]
         },
         srcs,
         s,
@@ -544,7 +552,7 @@ mod eval {
         dsts,
         |x| {
           assert_eq!(x.len(), 2);
-          vec![x[0].clone().neq(x[1].clone())]
+          vec![x[0].neq(&x[1])]
         },
         srcs,
         s,
