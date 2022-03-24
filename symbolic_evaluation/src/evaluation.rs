@@ -5,12 +5,12 @@ use crate::traits::{State, Transition, StateSet};
 /// Evaluate from initial state `init_state` using the
 /// `pickNext` as the search strategy, report all
 /// successing final states.
-pub fn eval<T, S, F, G>(init_state: T, pick_next: F, report: G)
+pub fn eval<T, S, F, G>(init_state: T, pick_next: F, mut report: G)
   where 
     T: State + Transition,
     S: StateSet<T>,
     F: Fn(&S) -> Option<T>,
-    G: Fn(T) -> (),
+    G: FnMut(T) -> (),
 {
   let mut frontier = S::new();
   frontier.insert(init_state);

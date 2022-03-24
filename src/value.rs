@@ -1,16 +1,98 @@
 //! Symolic move values.
 
 use move_core_types::account_address::AccountAddress;
-use move_model::model::{ModuleId, StructId};
+use move_model::{model::{ModuleId, StructId, QualifiedInstId, GlobalEnv, StructEnv, FieldEnv}};
 pub use move_model::ty::{PrimitiveType, Type};
 use move_stackless_bytecode::stackless_bytecode::Constant;
-use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem};
+use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem}, collections::BTreeMap};
 use z3::{
   Context,
+  Solver, SatResult,
   ast::{Ast, Bool, Dynamic, BV, Datatype},
-  DatatypeAccessor, DatatypeBuilder, Sort, Symbol, FuncDecl
+  Sort, Symbol, FuncDecl,
+  DatatypeAccessor, DatatypeBuilder, DatatypeSort,
 };
 
+/// Get the types of the fields of a struct.
+pub fn get_field_types(global_env: &GlobalEnv, mod_id: ModuleId, struct_id: StructId) -> Vec<Type> {
+  let struct_env = global_env.get_struct(mod_id.qualified(struct_id));
+  struct_env
+    .get_fields()
+    .map(|field_env| {
+      field_env.get_type()
+    })
+    .collect()
+}
+
+pub fn get_field_name<'env>(struct_env: &StructEnv<'env>, field_env: &FieldEnv<'env>) -> String {
+  let symbol_pool = struct_env.symbol_pool();
+  symbol_pool.string(field_env.get_name()).to_string()
+}
+
+pub struct Datatypes<'ctx, 'env> {
+  ctx: &'ctx Context,
+  global_env: &'env GlobalEnv,
+  table: BTreeMap<QualifiedInstId<StructId>, DatatypeSort<'ctx>>, 
+}
+
+// impl<'ctx, 'env> Datatypes<'ctx, 'env> {
+//   pub fn get_ctx(&self) -> &'ctx Context {
+//     self.ctx
+//   }
+
+//   /// Turn a resource id to a Z3 datatype, memoized.
+//   pub fn from_struct(&mut self, resource: QualifiedInstId<StructId>) -> DatatypeSort<'ctx> {
+//     match self.table.get(&resource) {
+//       Some(datatype) => *datatype,
+//       None => {
+//         let struct_env: StructEnv<'env> = self.global_env.get_module(resource.module_id).get_struct(resource.id);
+//         let field_names: Vec<String> = struct_env.get_fields().map(|field_env| get_field_name(&struct_env, &field_env)).collect();
+//         // (0..types.len()).map(|i| i.to_string()).collect();
+//         DatatypeBuilder::new(self.get_ctx(), format!("{}", struct_env.get_full_name_str()))
+//           .variant(
+//             "",
+//             field_names1.into_iter().
+//             zip(
+//               types.into_iter().map(|t| DatatypeAccessor::Sort(type_to_sort(t, ctx)))
+//             ).collect()
+//           )
+//           .finish()
+//       }
+//     }
+//   }
+
+//   // pub fn type_to_sort
+// }
+
+// warning!!
+// wrong when the struct is initiated differently.
+pub(crate) fn struct_type_to_datatype_sort<'ctx>(mod_id: ModuleId, struct_id: StructId, types: &[Type], ctx: &'ctx Context) -> DatatypeSort<'ctx> {
+  let field_names: Vec<String> = (0..types.len()).map(|i| i.to_string()).collect();
+  let field_names1: Vec<&str> = field_names.iter().map(|x| &x[..]).collect();
+  DatatypeBuilder::new(ctx, format!("{:?}::{:?}", mod_id, struct_id))
+  .variant(
+    "",
+    field_names1.into_iter().
+    zip(
+      types.into_iter().map(|t| DatatypeAccessor::Sort(type_to_sort(t, ctx)))
+    ).collect()
+  )
+  .finish()
+}
+
+pub fn primitive_type_to_sort<'ctx>(t: &PrimitiveType, ctx: &'ctx Context) -> Sort<'ctx> {
+  match t {
+    PrimitiveType::Bool => Sort::bool(ctx),
+    PrimitiveType::U8 => Sort::bitvector(ctx, 8),
+    PrimitiveType::U64 => Sort::bitvector(ctx, 64),
+    PrimitiveType::U128 => Sort::bitvector(ctx, 8),
+    PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+    PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+    _ => todo!(),
+  }
+}
+
+// TODO: this is wrong! use Datatype::type_to_sort instead.
 /// Construct a z3 sort from a move type.
 pub fn type_to_sort<'ctx>(t: &Type, ctx: &'ctx Context) -> Sort<'ctx> {
   match t {
@@ -21,24 +103,12 @@ pub fn type_to_sort<'ctx>(t: &Type, ctx: &'ctx Context) -> Sort<'ctx> {
       PrimitiveType::U128 => Sort::bitvector(ctx, 8),
       PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
       PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+      _ => todo!(),
     },
     // tuple
     // vector
     Type::Struct(mod_id, struct_id, types) => {
-      let data_type = DatatypeBuilder::new(ctx, format!("{:?}::{:?}", mod_id, struct_id))
-        .variant(
-          "",
-          (0..types.len())
-            .zip(types.iter())
-            .map(|(i, t)| {
-              (
-                &i.to_string()[..],
-                DatatypeAccessor::Sort(type_to_sort(t, ctx)),
-              )
-            })
-            .collect(),
-        )
-        .finish();
+      let data_type = struct_type_to_datatype_sort(*mod_id, *struct_id, types, ctx);
       data_type.sort
     }
     Type::TypeParameter(id) => Sort::uninterpreted(ctx, Symbol::from(*id as u32)),
@@ -48,6 +118,48 @@ pub fn type_to_sort<'ctx>(t: &Type, ctx: &'ctx Context) -> Sort<'ctx> {
 
 /// The type of formulae, i.e., terms of boolean sort.
 pub type Constraint<'ctx> = Bool<'ctx>;
+
+/// A pair of disjoint constraints. So true_branch & false_branch is never satisfiable.
+pub struct BranchCondition<'ctx> {
+  pub true_branch: Constraint<'ctx>,
+  pub false_branch: Constraint<'ctx>,
+}
+
+impl<'ctx> BitOr for BranchCondition<'ctx> {
+  type Output = Self;
+  fn bitor(self, rhs: Self) -> Self::Output {
+    match (self, rhs) {
+      (
+        BranchCondition { true_branch: t1, false_branch: f1 },
+        BranchCondition { true_branch: t2, false_branch: f2 },
+      ) => BranchCondition { true_branch: t1 | t2, false_branch: f1 | f2 },
+    }
+  }
+}
+
+impl<'ctx> BranchCondition<'ctx> {
+  /// The identity element of the | operation.
+  pub fn or_id(ctx: &'ctx Context) -> Self {
+    BranchCondition { true_branch: Bool::from_bool(ctx, false), false_branch: Bool::from_bool(ctx, false) }
+  }
+
+  /// Simplify fields.
+  pub fn simplify(self) -> Self {
+    match self {
+      BranchCondition { true_branch, false_branch } => BranchCondition { true_branch: true_branch.simplify(), false_branch: false_branch.simplify() }
+    }
+  }
+}
+
+/// Return false if the constraint is unsatisfiable.
+pub fn sat<'ctx>(constraint: &Constraint<'ctx>, ctx: &Context) -> bool {
+  let solver = Solver::new(ctx);
+  solver.assert(constraint);
+  match solver.check() {
+    SatResult::Unsat => false,
+    _ => true,
+  }
+}
 
 /// Primitive values.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -96,6 +208,17 @@ impl<'ctx> PrimitiveValue<'ctx> {
       }),
       // U256, Bytearray
       _ => unimplemented!(),
+    }
+  }
+
+  pub fn to_ast(&self) -> &dyn Ast<'ctx> {
+    match self {
+      PrimitiveValue::Bool(x) => x,
+      PrimitiveValue::U8(x) => x,
+      PrimitiveValue::U64(x) => x,
+      PrimitiveValue::U128(x) => x,
+      PrimitiveValue::Address(x) => x,
+      PrimitiveValue::Signer(x) => x,
     }
   }
 
@@ -545,25 +668,20 @@ impl<'ctx> Value<'ctx> {
       // Tuple
       // Vector
       Type::Struct(mod_id, struct_id, types) => {
-        let data_type = DatatypeBuilder::new(ctx, format!("{:?}::{:?}", mod_id, struct_id))
-          .variant(
-            "",
-            (0..types.len())
-              .zip(types.iter())
-              .map(|(i, t)| {
-                (
-                  &i.to_string()[..],
-                  DatatypeAccessor::Sort(type_to_sort(t, ctx)),
-                )
-              })
-              .collect(),
-          )
-          .finish();
+        let data_type = struct_type_to_datatype_sort(*mod_id, *struct_id, types, ctx);
         Value::Struct(Datatype::new_const(&ctx, x, &data_type.sort))
       }
       Type::TypeParameter(x) =>
         Value::TypeParameter(FuncDecl::new(ctx, *x as u32, &[], &type_to_sort(t, ctx)).apply(&[])),
       _ => unimplemented!(),
+    }
+  }
+
+  pub fn to_ast(&self) -> &dyn Ast<'ctx> {
+    match self {
+      Value::Primitive(x) => x.to_ast(),
+      Value::Struct(x) => x,
+      Value::TypeParameter(x) => x,
     }
   }
 
@@ -683,15 +801,17 @@ impl<'ctx> ConstrainedValue<'ctx> {
     (self.value, self.constraint)
   }
 
-  /// Turn a constrained boolean value to a constraint,
-  /// which is the conjunction of the value and the constraint.
-  pub fn to_constraint(self) -> Constraint<'ctx> {
+  /// Convert a constrainted boolean to a branch condition.
+  pub fn to_branch_condition(&self) -> BranchCondition<'ctx> {
     match self {
-      ConstrainedValue {
+      ConstrainedValue { 
         value: Value::Primitive(PrimitiveValue::Bool(b)),
         constraint,
-      } => b & constraint,
-      _ => panic!("Only values of boolean sort can be turned into a constraint."),
+      } => BranchCondition {
+        true_branch: b & constraint,
+        false_branch: !b & constraint,
+      },
+      _ => panic!("Runtime type error. {:?} is not a boolean.", self),
     }
   }
 
