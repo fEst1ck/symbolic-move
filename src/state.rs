@@ -1,7 +1,7 @@
 //! # Evaluation State
 use crate::value::{
   ConstrainedValue, Constraint, PrimitiveValue, Value, Type,
-  struct_type_to_datatype_sort, sat, BranchCondition,
+  struct_type_to_datatype_sort, sat, BranchCondition, Datatypes, Constrained,
 };
 use itertools::Itertools;
 use move_stackless_bytecode::{
@@ -317,59 +317,6 @@ impl<'ctx> LocalState<'ctx> {
   }
 }
 
-pub struct Constrained<'ctx, T> {
-  pub content: T,
-  pub constraint: Constraint<'ctx>,
-}
-
-impl<'ctx, T: Clone> Clone for Constrained<'ctx, T> {
-  fn clone(&self) -> Self {
-    Self {
-      content: self.content.clone(),
-      constraint: self.constraint.clone(),
-    }
-  }
-}
-
-/// Impose another constraint.
-impl<'ctx, T> BitAnd<Bool<'ctx>> for Constrained<'ctx, T> {
-  type Output = Self;
-
-  fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
-    Constrained {
-      constraint: self.constraint & rhs,
-      ..self
-    }
-  }
-}
-
-impl<'ctx, T: Clone> BitAnd<Bool<'ctx>> for &Constrained<'ctx, T> {
-  type Output = Constrained<'ctx, T>;
-
-  fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
-    Constrained {
-      constraint: &self.constraint & rhs,
-      content: self.content.clone(),
-    }
-  }
-}
-
-impl<'ctx, T> Constrained<'ctx, T> {
-  pub fn unconstrained(x: T, ctx: &'ctx Context) -> Self {
-    Self {
-      content: x,
-      constraint: Bool::from_bool(ctx, true),
-    }
-  }
-
-  pub fn simplify(self) -> Self {
-    Self {
-      constraint: self.constraint.simplify(),
-      ..self
-    }
-  }
-}
-
 pub type ConstrainedArray<'ctx> = Constrained<'ctx, Array<'ctx>>;
 
 pub type ConstrainedBool<'ctx> = Constrained<'ctx, Bool<'ctx>>;
@@ -380,18 +327,20 @@ impl<'ctx> ConstrainedBool<'ctx> {
   }
 }
 
-pub struct GlobalState<'ctx> {
+pub struct GlobalState<'ctx, 'env> {
   ctx: &'ctx Context,
-  pub global_state: BTreeMap<QualifiedInstId<StructId>, Vec<ConstrainedArray<'ctx>>>,
-  pub resource_exists: BTreeMap<QualifiedInstId<StructId>, Vec<ConstrainedBool<'ctx>>>,
+  datatypes: Datatypes<'ctx, 'env>,
+  pub resource_value: BTreeMap<QualifiedInstId<StructId>, Vec<ConstrainedArray<'ctx>>>,
+  pub resource_existence: BTreeMap<QualifiedInstId<StructId>, Vec<ConstrainedArray<'ctx>>>,
 }
 
-impl<'ctx> GlobalState<'ctx> {
-  pub fn new_empty(ctx: &'ctx Context) -> Self {
+impl<'ctx, 'env> GlobalState<'ctx, 'env> {
+  pub fn new_empty(ctx: &'ctx Context, global_env: &'env GlobalEnv) -> Self {
     Self {
       ctx,
-      global_state: BTreeMap::new(),
-      resource_exists: BTreeMap::new(),
+      resource_value: BTreeMap::new(),
+      resource_existence: BTreeMap::new(),
+      datatypes: Datatypes::new(ctx, global_env),
     }
   }
 
@@ -400,52 +349,47 @@ impl<'ctx> GlobalState<'ctx> {
   }
 
   /// Initialize resource and return the initial value.
-  pub fn init_global_state(&mut self, resource: &QualifiedInstId<StructId>) -> ConstrainedArray<'ctx> {
+  pub fn init_resource_value(&mut self, resource: &QualifiedInstId<StructId>) {
     let init_val: ConstrainedArray<'ctx> = Constrained {
-      content: Array::fresh_const(self.get_ctx(), "", &Sort::bitvector(self.get_ctx(), PrimitiveValue::LENGTH), todo!()),
+      content: Array::fresh_const(self.get_ctx(), "", &Sort::bitvector(self.get_ctx(), PrimitiveValue::LENGTH), &self.datatypes.from_struct(&resource).sort),
       constraint: Bool::from_bool(self.get_ctx(), true)
     };
-    self.global_state.insert(
+    self.resource_value.insert(
       resource.clone(),
       vec![init_val.clone()],
     );
-    init_val
   }
 
   /// Initialize resource and return the initial value.
-  pub fn init_resource_map(&mut self, resource: &QualifiedInstId<StructId>) -> ConstrainedBool<'ctx> {
-    let init_val: ConstrainedBool<'ctx> = Constrained {
-      content: Bool::fresh_const(self.get_ctx(), ""),
+  pub fn init_resource_map(&mut self, resource: &QualifiedInstId<StructId>) {
+    let init_val: ConstrainedArray<'ctx> = Constrained {
+      content: Array::fresh_const(self.get_ctx(), "", &Sort::bitvector(self.get_ctx(), PrimitiveValue::LENGTH), &Sort::bool(self.get_ctx())),
       constraint: Bool::from_bool(self.get_ctx(), true)
     };
-    self.resource_exists.insert(
+    self.resource_existence.insert(
       resource.clone(),
       vec![init_val.clone()],
     );
-    init_val
   }
 
   /// Return the condition that resource_type exists.
-  /// `self.resource_exists` is updated if `resource_type` is not contained.
-  pub fn exists(&mut self, resource_type: &QualifiedInstId<StructId>) -> Constraint<'ctx> {
-    match self.resource_exists.get(resource_type) {
-      Some(constrained_bools) => {
-        constrained_bools.iter().fold(
+  /// `self.resource_existence` is updated if `resource_type` is not contained.
+  pub fn exists(&mut self, resource_type: &QualifiedInstId<StructId>, addr: BV<'ctx>) -> Constraint<'ctx> {
+    match self.resource_existence.get(resource_type) {
+      Some(constrained_arrays) => {
+        constrained_arrays.iter().map(
+          |constrained_array| (constrained_array.content.select(&addr), &constrained_array.constraint)
+        )
+        .fold(
           Bool::from_bool(self.get_ctx(), false),
-          |acc, x| {
-            acc | (&x.content & &x.constraint).simplify()
-          }
+          |acc, (exists, constraint)|
+            (acc | (exists.as_bool().expect("resource_existence maps to non-boolean value") & constraint).simplify()).simplify()
         )
       }
       None => {
-        let fresh_bool: Bool = Bool::fresh_const(self.get_ctx(), "");
-        self.resource_exists.insert(
-          resource_type.clone(),
-          vec![
-            Constrained { content: fresh_bool.clone(), constraint: Bool::from_bool(self.get_ctx(), true) }
-            ],
-        );
-        fresh_bool
+        self.init_resource_map(resource_type);
+        self.init_resource_value(resource_type);
+        self.exists(resource_type, addr)
       }
     }
   }

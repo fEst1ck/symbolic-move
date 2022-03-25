@@ -1,5 +1,6 @@
 //! Symolic move values.
 
+use itertools::Itertools;
 use move_core_types::account_address::AccountAddress;
 use move_model::{model::{ModuleId, StructId, QualifiedInstId, GlobalEnv, StructEnv, FieldEnv}};
 pub use move_model::ty::{PrimitiveType, Type};
@@ -12,112 +13,156 @@ use z3::{
   Sort, Symbol, FuncDecl,
   DatatypeAccessor, DatatypeBuilder, DatatypeSort,
 };
-
-/// Get the types of the fields of a struct.
-pub fn get_field_types(global_env: &GlobalEnv, mod_id: ModuleId, struct_id: StructId) -> Vec<Type> {
-  let struct_env = global_env.get_struct(mod_id.qualified(struct_id));
-  struct_env
-    .get_fields()
-    .map(|field_env| {
-      field_env.get_type()
-    })
-    .collect()
-}
-
-pub fn get_field_name<'env>(struct_env: &StructEnv<'env>, field_env: &FieldEnv<'env>) -> String {
-  let symbol_pool = struct_env.symbol_pool();
-  symbol_pool.string(field_env.get_name()).to_string()
-}
-
 pub struct Datatypes<'ctx, 'env> {
   ctx: &'ctx Context,
   global_env: &'env GlobalEnv,
   table: BTreeMap<QualifiedInstId<StructId>, DatatypeSort<'ctx>>, 
 }
 
-// impl<'ctx, 'env> Datatypes<'ctx, 'env> {
-//   pub fn get_ctx(&self) -> &'ctx Context {
-//     self.ctx
-//   }
-
-//   /// Turn a resource id to a Z3 datatype, memoized.
-//   pub fn from_struct(&mut self, resource: QualifiedInstId<StructId>) -> DatatypeSort<'ctx> {
-//     match self.table.get(&resource) {
-//       Some(datatype) => *datatype,
-//       None => {
-//         let struct_env: StructEnv<'env> = self.global_env.get_module(resource.module_id).get_struct(resource.id);
-//         let field_names: Vec<String> = struct_env.get_fields().map(|field_env| get_field_name(&struct_env, &field_env)).collect();
-//         // (0..types.len()).map(|i| i.to_string()).collect();
-//         DatatypeBuilder::new(self.get_ctx(), format!("{}", struct_env.get_full_name_str()))
-//           .variant(
-//             "",
-//             field_names1.into_iter().
-//             zip(
-//               types.into_iter().map(|t| DatatypeAccessor::Sort(type_to_sort(t, ctx)))
-//             ).collect()
-//           )
-//           .finish()
-//       }
-//     }
-//   }
-
-//   // pub fn type_to_sort
-// }
-
-// warning!!
-// wrong when the struct is initiated differently.
-pub(crate) fn struct_type_to_datatype_sort<'ctx>(mod_id: ModuleId, struct_id: StructId, types: &[Type], ctx: &'ctx Context) -> DatatypeSort<'ctx> {
-  let field_names: Vec<String> = (0..types.len()).map(|i| i.to_string()).collect();
-  let field_names1: Vec<&str> = field_names.iter().map(|x| &x[..]).collect();
-  DatatypeBuilder::new(ctx, format!("{:?}::{:?}", mod_id, struct_id))
-  .variant(
-    "",
-    field_names1.into_iter().
-    zip(
-      types.into_iter().map(|t| DatatypeAccessor::Sort(type_to_sort(t, ctx)))
-    ).collect()
-  )
-  .finish()
-}
-
-pub fn primitive_type_to_sort<'ctx>(t: &PrimitiveType, ctx: &'ctx Context) -> Sort<'ctx> {
-  match t {
-    PrimitiveType::Bool => Sort::bool(ctx),
-    PrimitiveType::U8 => Sort::bitvector(ctx, 8),
-    PrimitiveType::U64 => Sort::bitvector(ctx, 64),
-    PrimitiveType::U128 => Sort::bitvector(ctx, 8),
-    PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
-    PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
-    _ => todo!(),
-  }
-}
-
-// TODO: this is wrong! use Datatype::type_to_sort instead.
-/// Construct a z3 sort from a move type.
-pub fn type_to_sort<'ctx>(t: &Type, ctx: &'ctx Context) -> Sort<'ctx> {
-  match t {
-    Type::Primitive(t) => match t {
-      PrimitiveType::Bool => Sort::bool(ctx),
-      PrimitiveType::U8 => Sort::bitvector(ctx, 8),
-      PrimitiveType::U64 => Sort::bitvector(ctx, 64),
-      PrimitiveType::U128 => Sort::bitvector(ctx, 8),
-      PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
-      PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
-      _ => todo!(),
-    },
-    // tuple
-    // vector
-    Type::Struct(mod_id, struct_id, types) => {
-      let data_type = struct_type_to_datatype_sort(*mod_id, *struct_id, types, ctx);
-      data_type.sort
+impl<'ctx, 'env> Datatypes<'ctx, 'env> {
+  pub fn new(ctx: &'ctx Context, global_env: &'env GlobalEnv) -> Self {
+    Self {
+      ctx,
+      global_env,
+      table: BTreeMap::new(),
     }
-    Type::TypeParameter(id) => Sort::uninterpreted(ctx, Symbol::from(*id as u32)),
-    _ => todo!(),
+  }
+
+  pub fn get_ctx(&self) -> &'ctx Context {
+    self.ctx
+  }
+
+  fn update(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) {
+    let module_env = self.global_env.get_module(module_id);
+    let struct_env: StructEnv = module_env.get_struct(struct_id);
+    let field_names: Vec<String> = struct_env.get_fields().map(|field_env| get_field_name(&struct_env, &field_env)).collect();
+    let data_type = DatatypeBuilder::new(self.get_ctx(), format!("{}<{:?}>", struct_env.get_full_name_str(), type_params.iter().format(", ")))
+      .variant(
+        "",
+        field_names.iter().map(|x| &x[..])
+        .zip(
+          type_params.iter().map(|t| DatatypeAccessor::Sort(self.type_to_sort(t)))
+        ).collect()
+      )
+      .finish();
+    let resource_id = QualifiedInstId { module_id, inst: type_params.clone(), id: struct_id };
+    self.table.insert(resource_id, data_type);
+  }
+
+  /// Turn a resource id to a Z3 datatype, memoized.
+  pub fn from_struct1(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) -> &DatatypeSort<'ctx> {
+    let resource_id = QualifiedInstId { module_id, inst: type_params.clone(), id: struct_id };
+    // cannot directly match self.table.get here, 
+    if self.table.contains_key(&resource_id) {
+      self.table.get(&resource_id).unwrap()
+    } else {
+      self.update(module_id, struct_id, type_params.clone());
+      self.from_struct1(module_id, struct_id, type_params)
+    }
+  }
+
+  /// Turn a resource id to a Z3 datatype, memoized.
+  pub fn from_struct(&mut self, resource: &QualifiedInstId<StructId>) -> &DatatypeSort<'ctx> {
+    self.from_struct1(resource.module_id, resource.id, resource.inst)
+  }
+
+  /// From move type to z3 sort.
+  pub fn type_to_sort(&mut self, t: &Type) -> Sort<'ctx> {
+    match t {
+      Type::Primitive(t) => primitive_type_to_sort(t, self.get_ctx()),
+      Type::Struct(module_id, struct_id, type_params) => self.from_struct1(*module_id, *struct_id, type_params.clone()).sort.clone(),
+      _ => todo!(),
+    }
   }
 }
 
 /// The type of formulae, i.e., terms of boolean sort.
 pub type Constraint<'ctx> = Bool<'ctx>;
+
+/// Return false if the constraint is unsatisfiable.
+pub fn sat<'ctx>(constraint: &Constraint<'ctx>, ctx: &Context) -> bool {
+  let solver = Solver::new(ctx);
+  solver.assert(constraint);
+  match solver.check() {
+    SatResult::Unsat => false,
+    _ => true,
+  }
+}
+
+pub struct Constrained<'ctx, T> {
+  pub content: T,
+  pub constraint: Constraint<'ctx>,
+}
+
+impl<'ctx, T: Clone> Clone for Constrained<'ctx, T> {
+  fn clone(&self) -> Self {
+    Self {
+      content: self.content.clone(),
+      constraint: self.constraint.clone(),
+    }
+  }
+}
+
+/// Impose another constraint.
+impl<'ctx, T> BitAnd<Bool<'ctx>> for Constrained<'ctx, T> {
+  type Output = Self;
+
+  fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
+    Constrained {
+      constraint: self.constraint & rhs,
+      ..self
+    }
+  }
+}
+
+impl<'ctx, T> BitAnd<&Bool<'ctx>> for Constrained<'ctx, T> {
+  type Output = Self;
+
+  fn bitand(self, rhs: &Bool<'ctx>) -> Self::Output {
+    Constrained {
+      constraint: self.constraint & rhs,
+      ..self
+    }
+  }
+}
+
+impl<'ctx, T: Clone> BitAnd<Bool<'ctx>> for &Constrained<'ctx, T> {
+  type Output = Constrained<'ctx, T>;
+
+  fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
+    Constrained {
+      constraint: &self.constraint & rhs,
+      content: self.content.clone(),
+    }
+  }
+}
+
+impl<'ctx, T: Clone> BitAnd<&Bool<'ctx>> for &Constrained<'ctx, T> {
+  type Output = Constrained<'ctx, T>;
+
+  fn bitand(self, rhs: &Bool<'ctx>) -> Self::Output {
+    Constrained {
+      constraint: &self.constraint & rhs,
+      content: self.content.clone(),
+    }
+  }
+}
+
+impl<'ctx, T> Constrained<'ctx, T> {
+  pub fn unconstrained(x: T, ctx: &'ctx Context) -> Self {
+    Self {
+      content: x,
+      constraint: Bool::from_bool(ctx, true),
+    }
+  }
+
+  pub fn simplify(self) -> Self {
+    Self {
+      constraint: self.constraint.simplify(),
+      ..self
+    }
+  }
+}
 
 /// A pair of disjoint constraints. So true_branch & false_branch is never satisfiable.
 pub struct BranchCondition<'ctx> {
@@ -148,16 +193,6 @@ impl<'ctx> BranchCondition<'ctx> {
     match self {
       BranchCondition { true_branch, false_branch } => BranchCondition { true_branch: true_branch.simplify(), false_branch: false_branch.simplify() }
     }
-  }
-}
-
-/// Return false if the constraint is unsatisfiable.
-pub fn sat<'ctx>(constraint: &Constraint<'ctx>, ctx: &Context) -> bool {
-  let solver = Solver::new(ctx);
-  solver.assert(constraint);
-  match solver.check() {
-    SatResult::Unsat => false,
-    _ => true,
   }
 }
 
@@ -211,6 +246,7 @@ impl<'ctx> PrimitiveValue<'ctx> {
     }
   }
 
+  /// Convert to the underlying ast.
   pub fn to_ast(&self) -> &dyn Ast<'ctx> {
     match self {
       PrimitiveValue::Bool(x) => x,
@@ -826,5 +862,74 @@ impl<'ctx> ConstrainedValue<'ctx> {
     } else {
       vec![self, other]
     }
+  }
+}
+
+// Utilities
+/// Get the types of the fields of a struct.
+pub fn get_field_types(global_env: &GlobalEnv, mod_id: ModuleId, struct_id: StructId) -> Vec<Type> {
+  let struct_env = global_env.get_struct(mod_id.qualified(struct_id));
+  struct_env
+    .get_fields()
+    .map(|field_env| {
+      field_env.get_type()
+    })
+    .collect()
+}
+
+pub fn get_field_name<'env>(struct_env: &StructEnv<'env>, field_env: &FieldEnv<'env>) -> String {
+  let symbol_pool = struct_env.symbol_pool();
+  symbol_pool.string(field_env.get_name()).to_string()
+}
+
+// warning!!
+// wrong when the struct is initiated differently.
+pub(crate) fn struct_type_to_datatype_sort<'ctx>(mod_id: ModuleId, struct_id: StructId, types: &[Type], ctx: &'ctx Context) -> DatatypeSort<'ctx> {
+  let field_names: Vec<String> = (0..types.len()).map(|i| i.to_string()).collect();
+  let field_names1: Vec<&str> = field_names.iter().map(|x| &x[..]).collect();
+  DatatypeBuilder::new(ctx, format!("{:?}::{:?}", mod_id, struct_id))
+  .variant(
+    "",
+    field_names1.into_iter().
+    zip(
+      types.into_iter().map(|t| DatatypeAccessor::Sort(type_to_sort(t, ctx)))
+    ).collect()
+  )
+  .finish()
+}
+
+pub fn primitive_type_to_sort<'ctx>(t: &PrimitiveType, ctx: &'ctx Context) -> Sort<'ctx> {
+  match t {
+    PrimitiveType::Bool => Sort::bool(ctx),
+    PrimitiveType::U8 => Sort::bitvector(ctx, 8),
+    PrimitiveType::U64 => Sort::bitvector(ctx, 64),
+    PrimitiveType::U128 => Sort::bitvector(ctx, 8),
+    PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+    PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+    _ => todo!(),
+  }
+}
+
+// TODO: this is wrong! use Datatype::type_to_sort instead.
+/// Construct a z3 sort from a move type.
+pub fn type_to_sort<'ctx>(t: &Type, ctx: &'ctx Context) -> Sort<'ctx> {
+  match t {
+    Type::Primitive(t) => match t {
+      PrimitiveType::Bool => Sort::bool(ctx),
+      PrimitiveType::U8 => Sort::bitvector(ctx, 8),
+      PrimitiveType::U64 => Sort::bitvector(ctx, 64),
+      PrimitiveType::U128 => Sort::bitvector(ctx, 8),
+      PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+      PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+      _ => todo!(),
+    },
+    // tuple
+    // vector
+    Type::Struct(mod_id, struct_id, types) => {
+      let data_type = struct_type_to_datatype_sort(*mod_id, *struct_id, types, ctx);
+      data_type.sort
+    }
+    Type::TypeParameter(id) => Sort::uninterpreted(ctx, Symbol::from(*id as u32)),
+    _ => todo!(),
   }
 }
