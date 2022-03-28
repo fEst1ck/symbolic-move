@@ -1,11 +1,11 @@
 //! Symolic move values.
 
-use itertools::Itertools;
+use itertools::{Itertools, iproduct};
 use move_core_types::account_address::AccountAddress;
 use move_model::{model::{ModuleId, StructId, QualifiedInstId, GlobalEnv, StructEnv, FieldEnv}};
 pub use move_model::ty::{PrimitiveType, Type};
 use move_stackless_bytecode::stackless_bytecode::Constant;
-use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem}, collections::BTreeMap};
+use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem}, collections::BTreeMap, iter::FromIterator, rc::Rc, cell::{Cell, RefCell}};
 use z3::{
   Context,
   Solver, SatResult,
@@ -13,6 +13,7 @@ use z3::{
   Sort, Symbol, FuncDecl,
   DatatypeAccessor, DatatypeBuilder, DatatypeSort,
 };
+
 pub struct Datatypes<'ctx, 'env> {
   ctx: &'ctx Context,
   global_env: &'env GlobalEnv,
@@ -80,8 +81,8 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
 pub type Constraint<'ctx> = Bool<'ctx>;
 
 /// Return false if the constraint is unsatisfiable.
-pub fn sat<'ctx>(constraint: &Constraint<'ctx>, ctx: &Context) -> bool {
-  let solver = Solver::new(ctx);
+pub fn sat<'ctx>(constraint: &Constraint<'ctx>) -> bool {
+  let solver = Solver::new(constraint.get_ctx());
   solver.assert(constraint);
   match solver.check() {
     SatResult::Unsat => false,
@@ -92,6 +93,88 @@ pub fn sat<'ctx>(constraint: &Constraint<'ctx>, ctx: &Context) -> bool {
 pub struct Constrained<'ctx, T> {
   pub content: T,
   pub constraint: Constraint<'ctx>,
+}
+
+impl<'ctx> Constrained<'ctx, Constraint<'ctx>> {
+  pub fn to_constraint(&self) -> Constraint<'ctx> {
+    &self.content & &self.constraint
+  }
+
+  pub fn to_constraint_opt(&self) -> Option<Constraint<'ctx>> {
+    let res = self.to_constraint();
+    if sat(&res) {
+      Some(res)
+    } else {
+      None
+    }
+  }
+}
+
+impl<'ctx> Constrained<'ctx, Value<'ctx>> {
+  pub fn to_constrained_value(self) -> ConstrainedValue<'ctx> {
+    ConstrainedValue { value: self.content, constraint: self.constraint }
+  }
+
+  pub fn from_constrained_value(x: ConstrainedValue<'ctx>) -> Self {
+    Self {
+      content: x.value,
+      constraint: x.constraint,
+    }
+  }
+}
+
+impl<'ctx, T> Constrained<'ctx, T> {
+  pub fn unconstrained(x: T, ctx: &'ctx Context) -> Self {
+    Self {
+      content: x,
+      constraint: Bool::from_bool(ctx, true),
+    }
+  }
+
+  /// Simplify the constraint.
+  pub fn simplify(self) -> Self {
+    Self {
+      constraint: self.constraint.simplify(),
+      ..self
+    }
+  }
+
+  /// Return none if the constraint is unsatisfiable.
+  pub fn filter(self) -> Option<Self> {
+    if sat(&self.constraint) {
+      Some(self)
+    } else {
+      None
+    }
+  }
+
+  /// Apply on the content field.
+  pub fn map<U, F>(self, f: F) -> Constrained<'ctx, U>
+  where F: Fn(T) -> U
+  {
+    Constrained { content: f(self.content), constraint: self.constraint }
+  }
+
+  /// (x, p) => pred(x) & p
+  pub fn pred<F>(self, pred: F) -> Constraint<'ctx>
+  where F: Fn(T) -> Constraint<'ctx>
+  {
+    self.map(pred).to_constraint()
+  }
+
+  /// (x, p) * (y, q) = ((x, y), p & q)
+  pub fn prod<U>(self, other: Constrained<'ctx, U>) -> Constrained<'ctx, (T, U)> {
+    Constrained { content: (self.content, other.content), constraint: self.constraint & other.constraint }
+  }
+
+  pub fn prod_opt<U>(self, other: Constrained<'ctx, U>) -> Option<Constrained<'ctx, (T, U)>> {
+    let prod = self.prod(other).simplify();
+    if sat(&prod.constraint) {
+      Some(prod)
+    } else {
+      None
+    }
+  }
 }
 
 impl<'ctx, T: Clone> Clone for Constrained<'ctx, T> {
@@ -148,19 +231,55 @@ impl<'ctx, T: Clone> BitAnd<&Bool<'ctx>> for &Constrained<'ctx, T> {
   }
 }
 
-impl<'ctx, T> Constrained<'ctx, T> {
-  pub fn unconstrained(x: T, ctx: &'ctx Context) -> Self {
-    Self {
-      content: x,
-      constraint: Bool::from_bool(ctx, true),
-    }
+/// Set of disjoint constrained values.
+pub type Union<'ctx> = Vec<ConstrainedValue<'ctx>>;
+
+pub struct Disjoints<'ctx, T>(pub Vec<Constrained<'ctx, T>>);
+
+impl<'ctx, T: Clone> Disjoints<'ctx, T> {
+  pub fn map<U, F>(self, f: F) -> Disjoints<'ctx, U>
+    where F: Fn(T) -> U
+  {
+    self.into_iter().map(|x| x.map(f)).collect()
   }
 
-  pub fn simplify(self) -> Self {
-    Self {
-      constraint: self.constraint.simplify(),
-      ..self
-    }
+  pub fn iter(&self) -> std::slice::Iter<'_, Constrained<'ctx, T>> {
+    self.0.iter()
+  }
+
+  pub fn filter_prod<U: Clone>(&self, other: &Disjoints<'ctx, U>) -> Disjoints<'ctx, (T, U)> {
+    Disjoints(
+      iproduct!(self.iter(), other.iter())
+      .filter_map(|(x, y)| x.clone().prod_opt(y.clone()))
+      .collect()
+    )
+  }
+}
+
+impl<'ctx> Disjoints<'ctx, Constraint<'ctx>> {
+  pub fn to_constraint(&self, ctx: &'ctx Context) -> Constraint<'ctx> {
+    self.iter().filter_map(|x| x.to_constraint_opt().map(|x| x.simplify())).fold(Bool::from_bool(ctx, false), |acc, x| acc | x)
+  }
+}
+
+impl<'ctx, T> IntoIterator for Disjoints<'ctx, T> {
+  type Item = Constrained<'ctx, T>;
+  type IntoIter = std::vec::IntoIter<Self::Item>;
+
+  fn into_iter(self) -> Self::IntoIter {
+      self.0.into_iter()
+  }
+}
+
+impl<'ctx, T> FromIterator<Constrained<'ctx, T>> for Disjoints<'ctx, T> {
+  fn from_iter<I: IntoIterator<Item=Constrained<'ctx, T>>>(iter: I) -> Self {
+    Self(iter.into_iter().collect())
+  }
+}
+
+impl<'ctx, T: Clone> Clone for Disjoints<'ctx, T> {
+  fn clone(&self) -> Self {
+    Disjoints(self.0.clone())
   }
 }
 
@@ -243,6 +362,13 @@ impl<'ctx> PrimitiveValue<'ctx> {
       }),
       // U256, Bytearray
       _ => unimplemented!(),
+    }
+  }
+
+  pub fn to_bool(&self) -> Option<&Bool<'ctx>> {
+    match self {
+      PrimitiveValue::Bool(x) => Some(x),
+      _ => None,
     }
   }
 
@@ -529,6 +655,115 @@ pub enum Value<'ctx> {
   TypeParameter(Dynamic<'ctx>),
 }
 
+impl<'ctx> Value<'ctx> {
+  /// Injection from closed values.
+  pub fn from_constant(c: &Constant, ctx: &'ctx Context) -> Self {
+    Value::Primitive(PrimitiveValue::from_constant(c, ctx))
+  }
+
+  /// Construct a new symbolic constant with the given type and name.
+  pub fn new_const<S: Into<Symbol>>(x: S, t: &Type, ctx: &'ctx Context) -> Self {
+    match t {
+      Type::Primitive(t) => Value::Primitive(PrimitiveValue::new_const(x, t, ctx)),
+      // Tuple
+      // Vector
+      Type::Struct(mod_id, struct_id, types) => {
+        let data_type = struct_type_to_datatype_sort(*mod_id, *struct_id, types, ctx);
+        Value::Struct(Datatype::new_const(&ctx, x, &data_type.sort))
+      }
+      Type::TypeParameter(x) =>
+        Value::TypeParameter(FuncDecl::new(ctx, *x as u32, &[], &type_to_sort(t, ctx)).apply(&[])),
+      _ => unimplemented!(),
+    }
+  }
+
+  pub fn as_bool(&self) -> Option<&Bool<'ctx>> {
+    match self {
+      Value::Primitive(PrimitiveValue::Bool(x)) => Some(x),
+      _ => None,
+    }
+  }
+
+  pub fn as_datatype(&self) -> Option<&Datatype<'ctx>> {
+    match self {
+      Value::Struct(x) => Some(x),
+      _ => None,
+    }
+  }
+
+  pub fn to_ast(&self) -> &dyn Ast<'ctx> {
+    match self {
+      Value::Primitive(x) => x.to_ast(),
+      Value::Struct(x) => x,
+      Value::TypeParameter(x) => x,
+    }
+  }
+
+  /// Arithmetic less than.
+  pub fn lt(&self, rhs: &Self) -> Self {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.lt(y)),
+      _ => panic!("Type mismatches."),
+    }
+  }
+
+  /// Arithmetic less or equal.
+  pub fn le(&self, rhs: &Self) -> Self {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.le(y)),
+      _ => panic!("Type mismatches."),
+    }
+  }
+
+  /// Arithmetic greater than.
+  pub fn gt(&self, rhs: &Self) -> Self {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.gt(y)),
+      _ => panic!("Type mismatches."),
+    }
+  }
+
+  /// Arithmetic greater of equal.
+  pub fn ge(&self, rhs: &Self) -> Self {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.ge(y)),
+      _ => panic!("Type mismatches."),
+    }
+  }
+
+  /// Logical and.
+  pub fn and(&self, rhs: &Self) -> Self {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.and(y)),
+      _ => panic!("Type mismatches."),
+    }
+  }
+
+  /// Logical or.
+  pub fn or(&self, rhs: &Self) -> Self {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.or(y)),
+      _ => panic!("Type mismatches."),
+    }
+  }
+
+  /// Equality comparison.
+  pub fn eq(&self, rhs: &Self) -> Self {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.eq(y)),
+      (Value::Struct(x), Value::Struct(y)) => Value::Primitive(PrimitiveValue::Bool(x._eq(y))),
+      (Value::TypeParameter(x), Value::TypeParameter(y)) => Value::Primitive(PrimitiveValue::Bool(x._eq(y))),
+      _ => todo!(),
+      _ => panic!("Type mismatches."),
+    }
+  }
+
+  /// Nonequality comparison.
+  pub fn neq(&self, rhs: &Self) -> Self {
+    !self.eq(rhs)
+  }
+}
+
 impl<'ctx> Add for Value<'ctx> {
   type Output = Self;
   fn add(self, rhs: Self) -> Self::Output {
@@ -688,101 +923,6 @@ impl<'ctx> Not for &Value<'ctx> {
       Value::Primitive(b) => Value::Primitive(!b),
       _ => panic!("Type mismatches."),
     }
-  }
-}
-
-impl<'ctx> Value<'ctx> {
-  /// Injection from closed values.
-  pub fn from_constant(c: &Constant, ctx: &'ctx Context) -> Self {
-    Value::Primitive(PrimitiveValue::from_constant(c, ctx))
-  }
-
-  /// Construct a new symbolic constant with the given type and name.
-  pub fn new_const<S: Into<Symbol>>(x: S, t: &Type, ctx: &'ctx Context) -> Self {
-    match t {
-      Type::Primitive(t) => Value::Primitive(PrimitiveValue::new_const(x, t, ctx)),
-      // Tuple
-      // Vector
-      Type::Struct(mod_id, struct_id, types) => {
-        let data_type = struct_type_to_datatype_sort(*mod_id, *struct_id, types, ctx);
-        Value::Struct(Datatype::new_const(&ctx, x, &data_type.sort))
-      }
-      Type::TypeParameter(x) =>
-        Value::TypeParameter(FuncDecl::new(ctx, *x as u32, &[], &type_to_sort(t, ctx)).apply(&[])),
-      _ => unimplemented!(),
-    }
-  }
-
-  pub fn to_ast(&self) -> &dyn Ast<'ctx> {
-    match self {
-      Value::Primitive(x) => x.to_ast(),
-      Value::Struct(x) => x,
-      Value::TypeParameter(x) => x,
-    }
-  }
-
-  /// Arithmetic less than.
-  pub fn lt(&self, rhs: &Self) -> Self {
-    match (self, rhs) {
-      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.lt(y)),
-      _ => panic!("Type mismatches."),
-    }
-  }
-
-  /// Arithmetic less or equal.
-  pub fn le(&self, rhs: &Self) -> Self {
-    match (self, rhs) {
-      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.le(y)),
-      _ => panic!("Type mismatches."),
-    }
-  }
-
-  /// Arithmetic greater than.
-  pub fn gt(&self, rhs: &Self) -> Self {
-    match (self, rhs) {
-      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.gt(y)),
-      _ => panic!("Type mismatches."),
-    }
-  }
-
-  /// Arithmetic greater of equal.
-  pub fn ge(&self, rhs: &Self) -> Self {
-    match (self, rhs) {
-      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.ge(y)),
-      _ => panic!("Type mismatches."),
-    }
-  }
-
-  /// Logical and.
-  pub fn and(&self, rhs: &Self) -> Self {
-    match (self, rhs) {
-      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.and(y)),
-      _ => panic!("Type mismatches."),
-    }
-  }
-
-  /// Logical or.
-  pub fn or(&self, rhs: &Self) -> Self {
-    match (self, rhs) {
-      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.or(y)),
-      _ => panic!("Type mismatches."),
-    }
-  }
-
-  /// Equality comparison.
-  pub fn eq(&self, rhs: &Self) -> Self {
-    match (self, rhs) {
-      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x.eq(y)),
-      (Value::Struct(x), Value::Struct(y)) => Value::Primitive(PrimitiveValue::Bool(x._eq(y))),
-      (Value::TypeParameter(x), Value::TypeParameter(y)) => Value::Primitive(PrimitiveValue::Bool(x._eq(y))),
-      _ => todo!(),
-      _ => panic!("Type mismatches."),
-    }
-  }
-
-  /// Nonequality comparison.
-  pub fn neq(&self, rhs: &Self) -> Self {
-    !self.eq(rhs)
   }
 }
 
