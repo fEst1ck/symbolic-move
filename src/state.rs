@@ -12,7 +12,7 @@ use move_stackless_bytecode::{
     function_target::{FunctionData, FunctionTarget},
     stackless_bytecode::{Bytecode, Label},
 };
-use std::fmt;
+use std::{fmt, cell::RefCell};
 use std::hash::{Hash, Hasher};
 use std::ops::{BitAnd, BitOr};
 use std::{
@@ -29,11 +29,11 @@ pub type CodeOffset = u16;
 pub type TempIndex = usize;
 pub type BlockId = CodeOffset;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum TerminationStatus<'ctx> {
     None,
-    Return(Vec<Union<'ctx>>),
-    Abort(Union<'ctx>),
+    Return(Vec<Disjoints<'ctx, Value<'ctx>>>),
+    Abort(Disjoints<'ctx, Value<'ctx>>),
     Unsat,
 }
 
@@ -66,9 +66,9 @@ impl<'ctx> TerminationStatus<'ctx> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Local<'ctx> {
-    content: Vec<ConstrainedValue<'ctx>>,
+    content: Disjoints<'ctx, Value<'ctx>>,
 }
 
 impl<'ctx, 'env> fmt::Display for Local<'ctx> {
@@ -82,13 +82,7 @@ impl<'ctx> BitAnd<Bool<'ctx>> for Local<'ctx> {
     type Output = Self;
 
     fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
-        Local {
-            content: self
-                .content
-                .into_iter()
-                .map(|x| ((x & rhs.clone()).simplify()))
-                .collect(),
-        }
+        Local { content: self.content & rhs }
     }
 }
 
@@ -103,35 +97,37 @@ impl<'ctx> BitOr<Local<'ctx>> for Local<'ctx> {
 impl<'ctx> Local<'ctx> {
     pub fn new() -> Self {
         Self {
-            content: Vec::new(),
+            content: Disjoints(Vec::new()),
         }
     }
 
     pub fn from_type<S: Into<Symbol>>(x: S, t: &Type, ctx: &'ctx Context) -> Self {
         Self {
-            content: vec![ConstrainedValue::new_const(x, t, ctx)],
+            content: Disjoints(vec![ConstrainedValue::new_const(x, t, ctx)]),
         }
     }
 
-    /// Turn a local of boolean sort into a constraint.
-    pub fn to_branch_condition(&self, ctx: &'ctx Context) -> BranchCondition<'ctx> {
-        self.content
-            .clone()
-            .into_iter()
-            .map(|x| x.to_branch_condition())
-            .fold(BranchCondition::or_id(ctx), |acc, x| (acc | x).simplify())
+    pub fn to_branch_condition(&self, ctx: &'ctx Context) -> Option<BranchCondition<'ctx>> {
+        let mut acc = BranchCondition::or_id(ctx);
+        for cv in self.content.clone() {
+            match cv.to_branch_condition() {
+                Some(bc) => acc = (acc | bc).simplify(),
+                None => return None
+            }
+        }
+        Some(acc)
     }
 
     /// Set the content to empty, and return the original value.
-    pub fn del(&mut self) -> Vec<ConstrainedValue<'ctx>> {
+    pub fn del(&mut self) -> Disjoints<'ctx, Value<'ctx>> {
         let res = self.content.clone();
-        self.content = Vec::new();
+        self.content = Disjoints(Vec::new());
         res
     }
 
     /// Return the number of possible values of the local.
     pub fn len(&self) -> usize {
-        self.content.len()
+        self.content.0.len()
     }
 
     /// Return the merge of the locals.
@@ -148,16 +144,16 @@ impl<'ctx> Local<'ctx> {
         }
         if self.len() == other.len() {
             Self {
-                content: merge_content(self.content, other.content),
+                content: Disjoints(merge_content(self.content.0, other.content.0)),
             }
         } else {
-            self.content.append(&mut other.content);
+            self.content.0.append(&mut other.content.0);
             self
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LocalState<'ctx> {
     context: &'ctx Context,
     // Instruction Counter
@@ -249,50 +245,14 @@ impl<'ctx> LocalState<'ctx> {
     }
 
     /// Return constrained tuples of operation arguments.
-    pub fn args(&self, srcs: &[TempIndex]) -> Vec<(Vec<Value<'ctx>>, Constraint<'ctx>)> {
-        // v = (x, p) vs = ((y ...), q)
-        // return ((y ... x), q & p)
-        fn add_operand<'ctx>(
-            ctx: &'ctx Context,
-            v: (Value<'ctx>, Constraint<'ctx>),
-            vs: (Vec<Value<'ctx>>, Constraint<'ctx>),
-        ) -> Option<(Vec<Value<'ctx>>, Constraint<'ctx>)> {
-            let (x, p) = v;
-            let (mut xs, q) = vs;
-            let constraint = (q & p).simplify();
-            if sat(&constraint) {
-                xs.push(x);
-                Some((xs, constraint))
-            } else {
-                None
-            }
-        }
-        // v = (x, p) vs = (((y ...), q) ...)
-        // return (((y ... x), q & p) ...) where q & p not unsat
-        fn add_operand1<'ctx>(
-            ctx: &'ctx Context,
-            v: ConstrainedValue<'ctx>,
-            args: Vec<(Vec<Value<'ctx>>, Constraint<'ctx>)>,
-        ) -> Vec<(Vec<Value<'ctx>>, Constraint<'ctx>)> {
-            args.into_iter()
-                .filter_map(|x| add_operand(ctx, v.clone().decompose(), x))
-                .collect()
-        }
-
-        fn add_operand2<'ctx>(
-            ctx: &'ctx Context,
-            v: Vec<ConstrainedValue<'ctx>>,
-            args: Vec<(Vec<Value<'ctx>>, Constraint<'ctx>)>,
-        ) -> Vec<(Vec<Value<'ctx>>, Constraint<'ctx>)> {
-            v.into_iter()
-                .map(|x| add_operand1(ctx, x, args.clone()))
-                .flatten()
-                .collect()
-        }
-        srcs.iter().fold(
-            vec![(Vec::new(), Bool::from_bool(self.get_ctx(), true))],
-            |acc, &x| add_operand2(self.get_ctx(), self.index(x).content.clone(), acc),
-        )
+    pub fn args(&self, srcs: &[TempIndex]) -> Disjoints<'ctx, Vec<Value<'ctx>>> {
+        srcs
+            .iter()
+            .map(|idx| self.index(*idx).content.clone().map(|x| vec![x]))
+            .fold(
+                Disjoints::unit(self.get_ctx()),
+                |acc, x| acc.mappend(x)
+            )
     }
 
     pub fn get_ctx(&self) -> &'ctx Context {
@@ -315,7 +275,7 @@ impl<'ctx> LocalState<'ctx> {
     }
 
     /// Set `var` to empty and return the original values of `var`.
-    pub fn del(&mut self, var: TempIndex) -> Vec<ConstrainedValue<'ctx>> {
+    pub fn del(&mut self, var: TempIndex) -> Disjoints<'ctx, Value<'ctx>> {
         self.index_mut(var).del()
     }
 }
@@ -326,25 +286,23 @@ pub type ConstrainedBool<'ctx> = Constrained<'ctx, Bool<'ctx>>;
 
 impl<'ctx> ConstrainedBool<'ctx> {
     pub fn default(ctx: &'ctx Context) -> Self {
-        Constrained::unconstrained(Bool::fresh_const(ctx, ""), ctx)
+        Constrained::pure(Bool::fresh_const(ctx, ""), ctx)
     }
 }
 
 #[derive(Clone)]
-pub struct GlobalState<'ctx, 'env> {
+pub struct GlobalState<'ctx> {
     ctx: &'ctx Context,
-    datatypes: Datatypes<'ctx, 'env>,
     pub resource_value: BTreeMap<QualifiedInstId<StructId>, Disjoints<'ctx, Array<'ctx>>>,
     pub resource_existence: BTreeMap<QualifiedInstId<StructId>, Disjoints<'ctx, Array<'ctx>>>,
 }
 
-impl<'ctx, 'env> GlobalState<'ctx, 'env> {
-    pub fn new_empty(ctx: &'ctx Context, global_env: &'env GlobalEnv) -> Self {
+impl<'ctx> GlobalState<'ctx> {
+    pub fn new_empty(ctx: &'ctx Context) -> Self {
         Self {
             ctx,
             resource_value: BTreeMap::new(),
             resource_existence: BTreeMap::new(),
-            datatypes: Datatypes::new(ctx, global_env),
         }
     }
 
@@ -352,34 +310,35 @@ impl<'ctx, 'env> GlobalState<'ctx, 'env> {
         self.ctx
     }
 
-    /// Initialize resource and return the initial value.
-    pub fn init_resource_value(&mut self, resource: &QualifiedInstId<StructId>) {
+    // Initialize resource value.
+    // acquire: called only when `resource` is not in `resource_value`.
+    fn init_resource_value<'env>(&mut self, datatypes: &mut Datatypes<'ctx, 'env>, resource: &QualifiedInstId<StructId>) {
         let init_val: ConstrainedArray<'ctx> = Constrained {
             content: Array::fresh_const(
                 self.get_ctx(),
-                "",
-                &Sort::bitvector(self.get_ctx(), PrimitiveValue::LENGTH),
-                &self.datatypes.from_struct(&resource).sort,
+                "global memory",
+                &Sort::bitvector(self.get_ctx(), PrimitiveValue::ADDR_LENGTH),
+                &datatypes.from_struct(&resource).sort,
             ),
             constraint: Bool::from_bool(self.get_ctx(), true),
         };
         self.resource_value
-            .insert(resource.clone(), Disjoints(vec![init_val.clone()]));
+            .insert(resource.clone(), Disjoints(vec![init_val]));
     }
 
-    /// Initialize resource and return the initial value.
-    pub fn init_resource_map(&mut self, resource: &QualifiedInstId<StructId>) {
+    // Similar to `init_resource_value`.
+    fn init_resource_existence(&mut self, resource: &QualifiedInstId<StructId>) {
         let init_val: ConstrainedArray<'ctx> = Constrained {
             content: Array::fresh_const(
                 self.get_ctx(),
-                "",
-                &Sort::bitvector(self.get_ctx(), PrimitiveValue::LENGTH),
+                "global memory domain",
+                &Sort::bitvector(self.get_ctx(), PrimitiveValue::ADDR_LENGTH),
                 &Sort::bool(self.get_ctx()),
             ),
             constraint: Bool::from_bool(self.get_ctx(), true),
         };
         self.resource_existence
-            .insert(resource.clone(), Disjoints(vec![init_val.clone()]));
+            .insert(resource.clone(), Disjoints(vec![init_val]));
     }
 
     pub fn get_resource_existence(
@@ -389,7 +348,7 @@ impl<'ctx, 'env> GlobalState<'ctx, 'env> {
         match self.resource_existence.get(resource) {
             Some(arrays) => arrays.clone(),
             None => {
-                self.init_resource_map(resource);
+                self.init_resource_existence(resource);
                 self.get_resource_existence(resource).clone()
             }
         }
@@ -402,60 +361,49 @@ impl<'ctx, 'env> GlobalState<'ctx, 'env> {
         resource_type: &QualifiedInstId<StructId>,
         addr: &Disjoints<'ctx, Value<'ctx>>,
     ) -> Disjoints<'ctx, Constraint<'ctx>> {
-        fn exist<'ctx>(
-            resource_map: &'ctx Constrained<Array<'ctx>>,
-            addr: Constrained<'ctx, BV<'ctx>>,
-        ) -> Constraint<'ctx> {
-            let prod: Constrained<(Array, BV)> = resource_map.clone().prod(addr);
-            prod.pred(|(array, bv)| {
-                (array
-                    .select(&bv)
-                    .as_bool()
-                    .expect("resource_existence contains non-boolean"))
-            })
-        }
-
         let resource_existence = self.get_resource_existence(resource_type);
-        let product = resource_existence.filter_prod(addr);
-        product.map(|(array, value)| {
-            array
-                .select(value.as_bool().unwrap())
-                .as_bool()
-                .expect("resource_existence contains non-boolean")
+        resource_existence
+            .filter_prod(addr)
+            .map(|(array, value)| {
+                array
+                    .select(value.as_addr().unwrap())
+                    .as_bool()
+                    .expect("resource_existence contains non-boolean")
         })
     }
 
-    pub fn real_move_to(
+    pub fn real_move_to<'env>(
         &mut self,
         resource_type: &QualifiedInstId<StructId>,
         addrs: &Disjoints<'ctx, BV<'ctx>>,
         resource: Disjoints<'ctx, Datatype<'ctx>>,
+        datatypes: &mut Datatypes<'ctx, 'env>
     ) {
         // update resource value map so that addr contains value
         // update resource existence map so that addr contains true
         match self.resource_value.get(resource_type) {
             Some(resource_value_maps) => {
                 let resource_vals: Disjoints<'ctx, Datatype<'ctx>> = resource;
-                let updated_resource_value_map = resource_value_maps
+                let new_resource_value_map = resource_value_maps
                     .filter_prod(addrs)
                     .filter_prod(&resource_vals)
                     .map(|((array, addr), resource_val)| array.store(&addr, &resource_val));
                 let resource_existence_map: &Disjoints<Array> =
                     self.resource_existence.get(resource_type).unwrap(); // already inited when checking for existence
-                let updated_resource_existence_map =
+                let new_resource_existence_map =
                     resource_existence_map
                         .filter_prod(addrs)
                         .map(|(array, addr)| {
                             array.store(&addr, &Bool::from_bool(self.get_ctx(), true))
                         });
                 self.resource_value
-                    .insert(resource_type.clone(), updated_resource_value_map);
+                    .insert(resource_type.clone(), new_resource_value_map);
                 self.resource_existence
-                    .insert(resource_type.clone(), updated_resource_existence_map);
+                    .insert(resource_type.clone(), new_resource_existence_map);
             }
             None => {
-                self.init_resource_map(resource_type);
-                self.real_move_to(resource_type, addrs, resource);
+                self.init_resource_value(datatypes, resource_type);
+                self.real_move_to(resource_type, addrs, resource, datatypes);
             }
         }
     }
@@ -468,7 +416,8 @@ pub struct MoveState<'ctx, 'env> {
     pub offset_to_block_id: BTreeMap<CodeOffset, BlockId>,
     pub bytecodes: &'env [Bytecode],
     local_state: LocalState<'ctx>,
-    global_state: GlobalState<'ctx, 'env>,
+    global_state: GlobalState<'ctx>,
+    datatypes: &'ctx RefCell<Datatypes<'ctx, 'env>>
 }
 
 impl<'ctx, 'env> fmt::Display for MoveState<'ctx, 'env> {
@@ -566,10 +515,12 @@ mod eval {
 
     // Evaluate a `Load`.
     fn load<'ctx>(dst: TempIndex, c: &Constant, mut s: LocalState<'ctx>) -> LocalState<'ctx> {
-        s[dst].content = vec![ConstrainedValue::new(
-            Value::from_constant(c, s.get_ctx()),
-            s.pc.clone(),
-        )];
+        s[dst].content = Disjoints(
+            vec![ConstrainedValue::new(
+                Value::from_constant(c, s.get_ctx()),
+                s.pc.clone(),
+            )]
+        );
         s.ic += 1;
         s
     }
@@ -598,7 +549,7 @@ mod eval {
         let BranchCondition {
             true_branch,
             false_branch,
-        } = s.index(cond).to_branch_condition(ctx);
+        } = s.index(cond).to_branch_condition(ctx).expect(&format!("${}, used as a branch condition, is not of boolean type.", cond));
         vec![
             jump(then_label, label_to_offset, s.clone() & true_branch),
             jump(else_label, label_to_offset, s & false_branch),
@@ -606,29 +557,43 @@ mod eval {
     }
 
     // Handle pure operations.
-    fn pure_operation<'ctx, F>(
+    // the arity of inputs is checked in `op
+    fn pure_local_operation<'ctx, F>(
         dsts: &[TempIndex],
         op: F,
         srcs: &[TempIndex],
         mut s: LocalState<'ctx>,
     ) -> LocalState<'ctx>
     where
-        F: Fn(Vec<Value<'ctx>>) -> Vec<Value<'ctx>>,
+        F: Fn(Vec<Value<'ctx>>) -> Vec<Value<'ctx>> + Clone,
     {
-        let constrined_args = s.args(srcs);
+        let constrained_args = s.args(srcs);
+        let res = constrained_args.map(op);
+        debug_assert!(res.0.len() == dsts.len());
         for &x in dsts {
             s.index_mut(x).del();
         }
-        for (args, constraint) in constrined_args {
-            let res = op(args);
-            debug_assert!(res.len() == dsts.len());
-            for (&x, val) in dsts.iter().zip(res.into_iter()) {
+        for Constrained { content: vals, constraint} in res {
+            for (&x, val) in dsts.iter().zip(vals.into_iter()) {
                 s.index_mut(x)
-                    .content
+                    .content.0
                     .push(ConstrainedValue::new(val, constraint.clone()))
             }
         }
         s
+    }
+
+    fn pure_local_operation_<'ctx, F>(
+        dsts: &[TempIndex],
+        op: F,
+        srcs: &[TempIndex],
+        mut s: LocalState<'ctx>,
+        mut t: GlobalState<'ctx>
+    ) -> Vec<(LocalState<'ctx>, GlobalState<'ctx>)>
+    where
+        F: Fn(Vec<Value<'ctx>>) -> Vec<Value<'ctx>> + Clone,
+    {
+        vec![(pure_local_operation(dsts, op, srcs, s), t)]
     }
 
     fn operation<'ctx, 'env>(
@@ -637,16 +602,17 @@ mod eval {
         srcs: &[TempIndex],
         _on_abort: Option<&AbortAction>,
         mut s: LocalState<'ctx>,
-        t: &mut GlobalState<'ctx, 'env>,
+        mut t: GlobalState<'ctx>,
         global_env: &GlobalEnv,
-    ) -> LocalState<'ctx> {
+        datatypes: &mut Datatypes<'ctx, 'env>
+    ) -> Vec<(LocalState<'ctx>, GlobalState<'ctx>)> {
         use Operation::*;
         s.ic += 1;
         match op {
             // Pack(ModuleId, StructId, Vec<Type>),
             Pack(mod_id, struct_id, type_params) => {
                 let ctx = s.get_ctx();
-                pure_operation(
+                pure_local_operation_(
                     dsts,
                     |x: Vec<Value>| {
                         let struct_type = get_struct_type(global_env, *mod_id, *struct_id);
@@ -672,25 +638,36 @@ mod eval {
                     },
                     srcs,
                     s,
+                    t,
                 )
             }
             // Unpack(ModuleId, StructId, Vec<Type>),
 
             // Resources
-            // MoveTo(ModuleId, StructId, Vec<Type>),
+            MoveTo(module_id, struct_id, type_params) => {
+                let dst = dsts[0];
+                let addr_val = s[srcs[0]].content.clone();
+                let resource_val = s[srcs[1]].content.clone();
+                let resource_type = QualifiedInstId { module_id: *module_id, inst: type_params.clone(), id: *struct_id };
+                let branch_condition = t.exists(&resource_type, &addr_val).to_branch_condition(s.get_ctx());
+                let true_branch_state = s.clone() & branch_condition.true_branch;
+                true_branch_state.ts = TerminationStatus::Abort(Disjoints(vec![]));
+                let false_branch_state = s & branch_condition.false_branch;
+                let false_branch_global_state = t.clone();
+                false_branch_global_state.real_move_to(&resource_type,
+                    &addr_val.map(|x| x.as_addr().unwrap().clone()),
+                    resource_val.map(|x| x.as_datatype().unwrap().clone()),
+                    datatypes
+                );
+                vec![(true_branch_state, t), (false_branch_state, false_branch_global_state)]
+            }
             // MoveFrom(ModuleId, StructId, Vec<Type>),
-            // Exists(ModuleId, StructId, Vec<Type>),
             Exists(module_id, struct_id, type_params) => {
                 let dst = dsts[0];
                 let src = srcs[0];
-                let src_val = Disjoints(
-                    s[src]
-                        .content
-                        .clone()
-                        .into_iter()
-                        .map(|x| Constrained::from_constrained_value(x))
-                        .collect(),
-                );
+                let src_val = s[src]
+                    .content
+                    .clone();
                 let resource_type = QualifiedInstId {
                     module_id: *module_id,
                     inst: type_params.clone(),
@@ -698,21 +675,15 @@ mod eval {
                 };
                 s[dst].content = t
                     .exists(&resource_type, &src_val)
-                    .0
-                    .into_iter()
-                    .map(|x| {
-                        x.map(|x| Value::Primitive(PrimitiveValue::Bool(x)))
-                            .to_constrained_value()
-                    })
-                    .collect();
-                s
+                    .map(|x| Value::Primitive(PrimitiveValue::Bool(x)));
+                vec![(s, t)]
             }
 
             // Unary
             // CastU8 => todo!
             // CastU64 => todo!
             // CastU128 => todo!
-            Not => pure_operation(
+            Not => pure_local_operation_(
                 dsts,
                 |x: Vec<Value>| {
                     assert_eq!(x.len(), 1);
@@ -720,9 +691,10 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
             // Binary
-            Add => pure_operation(
+            Add => pure_local_operation_(
                 dsts,
                 |x: Vec<Value>| {
                     assert_eq!(x.len(), 2);
@@ -730,8 +702,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Mul => pure_operation(
+            Mul => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -739,8 +712,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Div => pure_operation(
+            Div => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -748,8 +722,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Mod => pure_operation(
+            Mod => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -757,8 +732,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            BitOr => pure_operation(
+            BitOr => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -766,8 +742,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            BitAnd => pure_operation(
+            BitAnd => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -775,8 +752,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Xor => pure_operation(
+            Xor => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -784,10 +762,11 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
             // Shl,
             // Shr,
-            Lt => pure_operation(
+            Lt => pure_local_operation_(
                 dsts,
                 |x| {
                     println!("fjdkf");
@@ -796,8 +775,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Gt => pure_operation(
+            Gt => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -805,8 +785,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Le => pure_operation(
+            Le => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -814,8 +795,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Ge => pure_operation(
+            Ge => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -823,8 +805,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Or => pure_operation(
+            Or => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -832,8 +815,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            And => pure_operation(
+            And => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -841,8 +825,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Eq => pure_operation(
+            Eq => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -850,8 +835,9 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
-            Neq => pure_operation(
+            Neq => pure_local_operation_(
                 dsts,
                 |x| {
                     assert_eq!(x.len(), 2);
@@ -859,16 +845,17 @@ mod eval {
                 },
                 srcs,
                 s,
+                t,
             ),
             // CastU256,
-            _ => s,
-            _ => todo!(),
+            _ => vec![(s, t)],
         }
     }
 
     pub fn step<'ctx, 'env>(
         mut s: MoveState<'ctx, 'env>,
         instr: &Bytecode,
+        datatypes: &mut Datatypes<'ctx, 'env>
     ) -> Vec<MoveState<'ctx, 'env>> {
         match instr {
             Bytecode::Assign(_, dst, src, kind) => vec![MoveState {
@@ -877,16 +864,24 @@ mod eval {
             }],
             Bytecode::Call(_, dsts, op, srcs, on_abort) => {
                 let global_env = s.get_global_env();
-                s.local_state = operation(
+                let res = operation(
                     dsts,
                     op,
                     srcs,
                     on_abort.as_ref(),
                     s.local_state,
-                    &mut s.global_state,
+                    s.global_state,
                     global_env,
+                    datatypes
                 );
-                vec![s]
+                res.into_iter().map(
+                    |(local_state, global_state)|
+                        MoveState {
+                            local_state,
+                            global_state,
+                            ..s.clone()
+                        }
+                ).collect()
             }
             Bytecode::Ret(_, srcs) => vec![{
                 s.local_state.ts = TerminationStatus::Return(
@@ -943,7 +938,7 @@ impl<'ctx, 'env> Transition for MoveState<'ctx, 'env> {
     fn suc(self) -> Vec<MoveState<'ctx, 'env>> {
         assert!(!self.is_final());
         let instr = self.cur_instr().clone();
-        eval::step(self, &instr)
+        eval::step(self, &instr, self.datatypes.borrow_mut())
     }
 
     fn is_final(&self) -> bool {
@@ -1000,7 +995,7 @@ impl<'ctx, 'env> MoveState<'ctx, 'env> {
 }
 
 impl<'ctx, 'env> MoveState<'ctx, 'env> {
-    pub fn new_default(ctx: &'ctx Context, function_target: FunctionTarget<'env>) -> Self {
+    pub fn new_default(ctx: &'ctx Context, function_target: FunctionTarget<'env>, datatypes: &'ctx RefCell<Datatypes<'ctx, 'env>>) -> Self {
         Self {
             label_to_offset: Bytecode::label_offsets(function_target.data.code.as_slice()),
             offset_to_block_id: Self::generate_offset_to_block_id(
@@ -1022,8 +1017,9 @@ impl<'ctx, 'env> MoveState<'ctx, 'env> {
                 }
                 locals
             }),
-            global_state: GlobalState::new_empty(ctx, function_target.func_env.module_env.env),
+            global_state: GlobalState::new_empty(ctx),
             function_target,
+            datatypes
         }
     }
 

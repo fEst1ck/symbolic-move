@@ -5,7 +5,7 @@ use move_core_types::account_address::AccountAddress;
 use move_model::{model::{ModuleId, StructId, QualifiedInstId, GlobalEnv, StructEnv, FieldEnv}};
 pub use move_model::ty::{PrimitiveType, Type};
 use move_stackless_bytecode::stackless_bytecode::Constant;
-use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem}, collections::BTreeMap, iter::FromIterator, rc::Rc, cell::{Cell, RefCell}};
+use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem}, collections::BTreeMap, iter::FromIterator, rc::Rc, cell::{Cell, RefCell}, fmt::{Display, self}};
 use z3::{
   Context,
   Solver, SatResult,
@@ -64,7 +64,7 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
 
   /// Turn a resource id to a Z3 datatype, memoized.
   pub fn from_struct(&mut self, resource: &QualifiedInstId<StructId>) -> &DatatypeSort<'ctx> {
-    self.from_struct1(resource.module_id, resource.id, resource.inst)
+    self.from_struct1(resource.module_id, resource.id, resource.inst.clone())
   }
 
   /// From move type to z3 sort.
@@ -90,41 +90,103 @@ pub fn sat<'ctx>(constraint: &Constraint<'ctx>) -> bool {
   }
 }
 
+/// Return None if the constraint is unsatisfiable, else the wrapped value.
+pub fn constraint_filter<'ctx>(constraint: Constraint<'ctx>) -> Option<Constraint<'ctx>> {
+  if sat(&constraint) {
+    Some(constraint)
+  } else {
+    None
+  }
+}
+
+// The (_, Constrained) functor
 pub struct Constrained<'ctx, T> {
   pub content: T,
   pub constraint: Constraint<'ctx>,
 }
 
 impl<'ctx> Constrained<'ctx, Constraint<'ctx>> {
+  /// (x, p) => x & p
   pub fn to_constraint(&self) -> Constraint<'ctx> {
     &self.content & &self.constraint
   }
 
+  /// Return none if the constraint is unsatisfiable.
   pub fn to_constraint_opt(&self) -> Option<Constraint<'ctx>> {
-    let res = self.to_constraint();
-    if sat(&res) {
-      Some(res)
-    } else {
-      None
+    constraint_filter(self.to_constraint())
+  }
+
+  pub fn to_branch_condition(&self) -> BranchCondition<'ctx> {
+    match self {
+      Constrained { 
+        content: b,
+        constraint,
+      } => 
+        BranchCondition {
+          true_branch: b & constraint,
+          false_branch: !b & constraint,
+        }
     }
   }
 }
 
-impl<'ctx> Constrained<'ctx, Value<'ctx>> {
-  pub fn to_constrained_value(self) -> ConstrainedValue<'ctx> {
-    ConstrainedValue { value: self.content, constraint: self.constraint }
+impl<'ctx, T> Constrained<'ctx, Vec<T>> {
+  pub fn mappend(mut self, mut other: Self) -> Self {
+    self.content.append(&mut other.content);
+    self.constraint = self.constraint & other.constraint;
+    self
+  }
+}
+
+pub type ConstrainedValue<'ctx> = Constrained<'ctx, Value<'ctx>>;
+
+impl<'ctx> ConstrainedValue<'ctx> {
+  /// Construct a new symbolic constant with the given name and type.
+  pub fn new_const<S: Into<Symbol>>(x: S, t: &Type, context: &'ctx Context) -> Self {
+    Constrained::pure(Value::new_const(x, t, context), context)
   }
 
-  pub fn from_constrained_value(x: ConstrainedValue<'ctx>) -> Self {
-    Self {
-      content: x.value,
-      constraint: x.constraint,
+  /// Convert a constrained boolean to a branch condition.
+  pub fn to_branch_condition(&self) -> Option<BranchCondition<'ctx>> {
+    match self {
+      Constrained { 
+        content: Value::Primitive(PrimitiveValue::Bool(b)),
+        constraint,
+      } => Some(
+        BranchCondition {
+          true_branch: b & constraint,
+          false_branch: !b & constraint,
+        }
+      ),
+      _ => None,
+    }
+  }
+}
+
+impl<'ctx, T: Eq> Constrained<'ctx, T> {
+  /// Return a single merged value if `self` and `other` have identical values,
+  /// otherwise a union of `self` and `other`.
+  pub fn merge(self, other: Self) -> Vec<Self> {
+    if self.content == other.content {
+      vec![
+        Self {
+          content: self.content,
+          constraint: (self.constraint | other.constraint).simplify(),
+        }  
+      ]
+    } else {
+      vec![self, other]
     }
   }
 }
 
 impl<'ctx, T> Constrained<'ctx, T> {
-  pub fn unconstrained(x: T, ctx: &'ctx Context) -> Self {
+  pub fn new(content: T, constraint: Constraint<'ctx>) -> Self {
+    Self { content, constraint }
+  }
+
+  /// Return the value constrained by true.
+  pub fn pure(x: T, ctx: &'ctx Context) -> Self {
     Self {
       content: x,
       constraint: Bool::from_bool(ctx, true),
@@ -148,7 +210,7 @@ impl<'ctx, T> Constrained<'ctx, T> {
     }
   }
 
-  /// Apply on the content field.
+  /// Apply f lifted.
   pub fn map<U, F>(self, f: F) -> Constrained<'ctx, U>
   where F: Fn(T) -> U
   {
@@ -162,19 +224,17 @@ impl<'ctx, T> Constrained<'ctx, T> {
     self.map(pred).to_constraint()
   }
 
-  /// (x, p) * (y, q) = ((x, y), p & q)
+  /// (x, p) * (y, q) => ((x, y), p & q)
   pub fn prod<U>(self, other: Constrained<'ctx, U>) -> Constrained<'ctx, (T, U)> {
     Constrained { content: (self.content, other.content), constraint: self.constraint & other.constraint }
   }
+}
 
-  pub fn prod_opt<U>(self, other: Constrained<'ctx, U>) -> Option<Constrained<'ctx, (T, U)>> {
-    let prod = self.prod(other).simplify();
-    if sat(&prod.constraint) {
-      Some(prod)
-    } else {
-      None
-    }
-  }
+pub fn map2_constrained<'ctx, A, B, C, F>(f: F, arg: (Constrained<'ctx, A>, Constrained<'ctx, B>)) -> Constrained<'ctx, C>
+  where F: Fn((A, B)) -> C 
+{
+  let arg = arg.0.prod(arg.1);
+  arg.map(f)
 }
 
 impl<'ctx, T: Clone> Clone for Constrained<'ctx, T> {
@@ -231,16 +291,73 @@ impl<'ctx, T: Clone> BitAnd<&Bool<'ctx>> for &Constrained<'ctx, T> {
   }
 }
 
+impl<'ctx, T: Display> Display for Constrained<'ctx, T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "({}, {})", self.content, self.constraint)
+  }
+}
+
 /// Set of disjoint constrained values.
 pub type Union<'ctx> = Vec<ConstrainedValue<'ctx>>;
 
 pub struct Disjoints<'ctx, T>(pub Vec<Constrained<'ctx, T>>);
 
+impl<'ctx> Disjoints<'ctx, Constraint<'ctx>> {
+  /// (p, q) ... => (p & q) | ...
+  pub fn to_constraint(&self, ctx: &'ctx Context) -> Constraint<'ctx> {
+    self.iter().filter_map(|x| x.to_constraint_opt().map(|x| x.simplify())).fold(Bool::from_bool(ctx, false), |acc, x| acc | x)
+  }
+
+  /// Convert a constrained boolean to a branch condition.
+  pub fn to_branch_condition(&self, ctx: &'ctx Context) -> BranchCondition<'ctx> {
+    let mut acc = BranchCondition::or_id(ctx);
+    for cv in &self.0 {
+      let bc = cv.to_branch_condition();
+      acc = (acc | bc).simplify();
+    }
+    acc
+  }
+}
+
+impl<'ctx> Disjoints<'ctx, Value<'ctx>> {
+  pub fn to_branch_condition(&self, ctx: &'ctx Context) -> Option<BranchCondition<'ctx>> {
+    let mut acc = BranchCondition::or_id(ctx);
+    for cv in &self.0 {
+        match cv.to_branch_condition() {
+            Some(bc) => acc = (acc | bc).simplify(),
+            None => return None
+        }
+    }
+    Some(acc)
+  }
+}
+
+impl<'ctx, T: Clone> Disjoints<'ctx, Vec<T>> {
+  pub fn unit(ctx: &'ctx Context) -> Self {
+    Self(vec![Constrained { content: Vec::new(), constraint: Bool::from_bool(ctx, true)}])
+  }
+  
+  pub fn mappend(self, other: Self) -> Self {
+    Disjoints(
+      iproduct!(self.into_iter(), other.into_iter())
+      .filter_map(|(x, y)| x.mappend(y).simplify().filter())
+      .collect()
+    )
+  }
+}
+
+pub fn fmap2_disjoints<'ctx, A: Clone, B: Clone, C, F>(f: F, args: (&Disjoints<'ctx, A>, &Disjoints<'ctx, B>)) -> Disjoints<'ctx, C> 
+  where F: Fn((A, B)) -> C + Clone
+{
+  let arg = args.0.filter_prod(&args.1);
+  arg.map(f)
+}
+
 impl<'ctx, T: Clone> Disjoints<'ctx, T> {
   pub fn map<U, F>(self, f: F) -> Disjoints<'ctx, U>
-    where F: Fn(T) -> U
+    where F: Fn(T) -> U + Clone
   {
-    self.into_iter().map(|x| x.map(f)).collect()
+    self.into_iter().map(|x| x.map(f.clone())).collect()
   }
 
   pub fn iter(&self) -> std::slice::Iter<'_, Constrained<'ctx, T>> {
@@ -250,15 +367,25 @@ impl<'ctx, T: Clone> Disjoints<'ctx, T> {
   pub fn filter_prod<U: Clone>(&self, other: &Disjoints<'ctx, U>) -> Disjoints<'ctx, (T, U)> {
     Disjoints(
       iproduct!(self.iter(), other.iter())
-      .filter_map(|(x, y)| x.clone().prod_opt(y.clone()))
+      .filter_map(|(x, y)| x.clone().prod(y.clone()).simplify().filter())
       .collect()
     )
   }
 }
 
-impl<'ctx> Disjoints<'ctx, Constraint<'ctx>> {
-  pub fn to_constraint(&self, ctx: &'ctx Context) -> Constraint<'ctx> {
-    self.iter().filter_map(|x| x.to_constraint_opt().map(|x| x.simplify())).fold(Bool::from_bool(ctx, false), |acc, x| acc | x)
+impl<'ctx, T: Clone> BitAnd<Bool<'ctx>> for Disjoints<'ctx, T> {
+  type Output = Self;
+
+  fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
+    self.into_iter().map(|x| x & &rhs).collect()
+  }
+}
+
+impl<'ctx, T: Clone> BitAnd<&Bool<'ctx>> for Disjoints<'ctx, T> {
+  type Output = Self;
+
+  fn bitand(self, rhs: &Bool<'ctx>) -> Self::Output {
+    self.into_iter().map(|x| x & rhs).collect()
   }
 }
 
@@ -327,7 +454,7 @@ pub enum PrimitiveValue<'ctx> {
 }
 
 impl<'ctx> PrimitiveValue<'ctx> {
-  pub const LENGTH: u32 = 8 * AccountAddress::LENGTH as u32;
+  pub const ADDR_LENGTH: u32 = 8 * AccountAddress::LENGTH as u32;
 
   /// Construct a constant symbolic value with the given primitive type and name.
   pub fn new_const<S: Into<Symbol>>(x: S, t: &PrimitiveType, ctx: &'ctx Context) -> Self {
@@ -336,8 +463,8 @@ impl<'ctx> PrimitiveValue<'ctx> {
       PrimitiveType::U8 => PrimitiveValue::U8(BV::new_const(ctx, x, 8)),
       PrimitiveType::U64 => PrimitiveValue::U64(BV::new_const(ctx, x, 64)),
       PrimitiveType::U128 => PrimitiveValue::U128(BV::new_const(ctx, x, 128)),
-      PrimitiveType::Address => PrimitiveValue::Address(BV::new_const(ctx, x, Self::LENGTH)),
-      PrimitiveType::Signer => PrimitiveValue::Signer(BV::new_const(ctx, x, Self::LENGTH)),
+      PrimitiveType::Address => PrimitiveValue::Address(BV::new_const(ctx, x, Self::ADDR_LENGTH)),
+      PrimitiveType::Signer => PrimitiveValue::Signer(BV::new_const(ctx, x, Self::ADDR_LENGTH)),
       _ => unreachable!(),
     }
   }
@@ -358,7 +485,7 @@ impl<'ctx> PrimitiveValue<'ctx> {
             BV::from_u64(ctx, x, 64).concat(&acc)
           });
         res = res.extract(res.get_size() - 1, 1);
-        res.zero_ext(Self::LENGTH - res.get_size())
+        res.zero_ext(Self::ADDR_LENGTH - res.get_size())
       }),
       // U256, Bytearray
       _ => unimplemented!(),
@@ -454,6 +581,16 @@ impl<'ctx> PrimitiveValue<'ctx> {
   /// Nonequality comparison.
   pub fn neq(&self, rhs: &Self) -> Self {
     !self.eq(rhs)
+  }
+}
+
+impl<'ctx> Display for PrimitiveValue<'ctx> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      PrimitiveValue::Bool(x) => write!(f, "{}", x),
+      PrimitiveValue::Address(x) => write!(f, "addr: {}", x),
+      _ => write!(f, "{:?}", self),
+    }
   }
 }
 
@@ -684,6 +821,14 @@ impl<'ctx> Value<'ctx> {
     }
   }
 
+  pub fn as_addr(&self) -> Option<&BV<'ctx>> {
+    match self {
+      Value::Primitive(PrimitiveValue::Address(x)) => Some(x),
+      Value::Primitive(PrimitiveValue::Signer(x)) => Some(x),
+      _ => None,
+    }
+  }
+
   pub fn as_datatype(&self) -> Option<&Datatype<'ctx>> {
     match self {
       Value::Struct(x) => Some(x),
@@ -761,6 +906,16 @@ impl<'ctx> Value<'ctx> {
   /// Nonequality comparison.
   pub fn neq(&self, rhs: &Self) -> Self {
     !self.eq(rhs)
+  }
+}
+
+impl<'ctx> Display for Value<'ctx> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Value::Primitive(x) => write!(f, "{}", x),
+      Value::Struct(x) => write!(f, "{}", x),
+      _ => write!(f, "{:?}", self),
+    }
   }
 }
 
@@ -926,85 +1081,6 @@ impl<'ctx> Not for &Value<'ctx> {
   }
 }
 
-/// Product of `Value` and `Constraint`.
-#[derive(Clone, Debug)]
-pub struct ConstrainedValue<'ctx> {
-  value: Value<'ctx>,
-  constraint: Constraint<'ctx>,
-}
-
-use std::fmt;
-impl<'ctx> fmt::Display for ConstrainedValue<'ctx> {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "({:?}, {:?})", self.value, self.constraint)
-  }
-}
-
-/// Impose another constraint.
-impl<'ctx> BitAnd<Bool<'ctx>> for ConstrainedValue<'ctx> {
-  type Output = Self;
-
-  fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
-    ConstrainedValue {
-      constraint: self.constraint & rhs,
-      ..self
-    }
-  }
-}
-
-impl<'ctx> ConstrainedValue<'ctx> {
-  pub fn new(value: Value<'ctx>, constraint: Constraint<'ctx>) -> Self {
-    Self { value, constraint }
-  }
-
-  /// Simplify the constraint.
-  pub fn simplify(self) -> Self {
-    Self {
-      constraint: self.constraint.simplify(),
-      ..self
-    }
-  }
-
-  /// Construct a new symbolic constant with the given name and type.
-  pub fn new_const<S: Into<Symbol>>(x: S, t: &Type, context: &'ctx Context) -> Self {
-    Self {
-      value: Value::new_const(x, t, context),
-      constraint: Bool::from_bool(context, true),
-    }
-  }
-
-  pub fn decompose(self) -> (Value<'ctx>, Constraint<'ctx>) {
-    (self.value, self.constraint)
-  }
-
-  /// Convert a constrainted boolean to a branch condition.
-  pub fn to_branch_condition(&self) -> BranchCondition<'ctx> {
-    match self {
-      ConstrainedValue { 
-        value: Value::Primitive(PrimitiveValue::Bool(b)),
-        constraint,
-      } => BranchCondition {
-        true_branch: b & constraint,
-        false_branch: !b & constraint,
-      },
-      _ => panic!("Runtime type error. {:?} is not a boolean.", self),
-    }
-  }
-
-  /// Return a single merged value if `self` and `other` have identical values,
-  /// otherwise a union of `self` and `other`.
-  pub fn merge(self, other: Self) -> Vec<Self> {
-    if self.value == other.value {
-      vec![Self::new(
-        self.value,
-        (self.constraint | other.constraint).simplify(),
-      )]
-    } else {
-      vec![self, other]
-    }
-  }
-}
-
 // Utilities
 /// Get the types of the fields of a struct.
 pub fn get_field_types(global_env: &GlobalEnv, mod_id: ModuleId, struct_id: StructId) -> Vec<Type> {
@@ -1044,8 +1120,8 @@ pub fn primitive_type_to_sort<'ctx>(t: &PrimitiveType, ctx: &'ctx Context) -> So
     PrimitiveType::U8 => Sort::bitvector(ctx, 8),
     PrimitiveType::U64 => Sort::bitvector(ctx, 64),
     PrimitiveType::U128 => Sort::bitvector(ctx, 8),
-    PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
-    PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+    PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::ADDR_LENGTH),
+    PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::ADDR_LENGTH),
     _ => todo!(),
   }
 }
@@ -1059,8 +1135,8 @@ pub fn type_to_sort<'ctx>(t: &Type, ctx: &'ctx Context) -> Sort<'ctx> {
       PrimitiveType::U8 => Sort::bitvector(ctx, 8),
       PrimitiveType::U64 => Sort::bitvector(ctx, 64),
       PrimitiveType::U128 => Sort::bitvector(ctx, 8),
-      PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
-      PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::LENGTH),
+      PrimitiveType::Address => Sort::bitvector(ctx, PrimitiveValue::ADDR_LENGTH),
+      PrimitiveType::Signer => Sort::bitvector(ctx, PrimitiveValue::ADDR_LENGTH),
       _ => todo!(),
     },
     // tuple
