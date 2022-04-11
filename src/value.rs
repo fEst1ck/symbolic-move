@@ -5,7 +5,7 @@ use move_core_types::account_address::AccountAddress;
 use move_model::{model::{ModuleId, StructId, QualifiedInstId, GlobalEnv, StructEnv, FieldEnv}};
 pub use move_model::ty::{PrimitiveType, Type};
 use move_stackless_bytecode::stackless_bytecode::Constant;
-use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem}, collections::BTreeMap, iter::FromIterator, rc::Rc, cell::{Cell, RefCell}, fmt::{Display, self}};
+use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem, Sub}, collections::BTreeMap, iter::FromIterator, fmt::{Display, self}, cell::RefCell};
 use z3::{
   Context,
   Solver, SatResult,
@@ -14,10 +14,14 @@ use z3::{
   DatatypeAccessor, DatatypeBuilder, DatatypeSort,
 };
 
+pub type ResourceId = QualifiedInstId<StructId>;
+
+/// Table from resource id to z3 sort. Used to create a memoized function
+/// from move type to z3 sort.
 pub struct Datatypes<'ctx, 'env> {
   ctx: &'ctx Context,
   global_env: &'env GlobalEnv,
-  table: BTreeMap<QualifiedInstId<StructId>, DatatypeSort<'ctx>>, 
+  table: BTreeMap<ResourceId, DatatypeSort<'ctx>>, 
 }
 
 impl<'ctx, 'env> Datatypes<'ctx, 'env> {
@@ -33,37 +37,64 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
     self.ctx
   }
 
-  fn update(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) {
-    let module_env = self.global_env.get_module(module_id);
-    let struct_env: StructEnv = module_env.get_struct(struct_id);
-    let field_names: Vec<String> = struct_env.get_fields().map(|field_env| get_field_name(&struct_env, &field_env)).collect();
-    let data_type = DatatypeBuilder::new(self.get_ctx(), format!("{}<{:?}>", struct_env.get_full_name_str(), type_params.iter().format(", ")))
-      .variant(
-        "",
-        field_names.iter().map(|x| &x[..])
-        .zip(
-          type_params.iter().map(|t| DatatypeAccessor::Sort(self.type_to_sort(t)))
-        ).collect()
-      )
-      .finish();
-    let resource_id = QualifiedInstId { module_id, inst: type_params.clone(), id: struct_id };
-    self.table.insert(resource_id, data_type);
+  // Get the uninitiated struct type.
+  pub fn get_struct_type(&self, mod_id: ModuleId, struct_id: StructId) -> Type {
+    let struct_env = self.global_env.get_struct(mod_id.qualified(struct_id));
+    let field_types: Vec<Type> = struct_env
+        .get_fields()
+        .map(|field_env| field_env.get_type())
+        .collect();
+    Type::Struct(mod_id, struct_id, field_types)
+  }
+
+  // Get the uninitiated struct type.
+  pub fn get_field_types(&self, mod_id: ModuleId, struct_id: StructId) -> Vec<Type> {
+    let struct_env = self.global_env.get_struct(mod_id.qualified(struct_id));
+    let field_types: Vec<Type> = struct_env
+        .get_fields()
+        .map(|field_env| field_env.get_type())
+        .collect();
+    field_types
+  }
+
+  fn insert(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) {
+    let struct_type = self.get_struct_type(module_id, struct_id);
+    let instantiated_struct_type = struct_type.instantiate(&type_params);
+    match instantiated_struct_type {
+      Type::Struct(_, _, field_types) => {
+        let module_env = self.global_env.get_module(module_id);
+        let struct_env: StructEnv = module_env.get_struct(struct_id);
+        let field_names: Vec<String> = struct_env.get_fields().map(|field_env| get_field_name(&struct_env, &field_env)).collect();
+        let data_type = DatatypeBuilder::new(self.get_ctx(), format!("{}<{:?}>", struct_env.get_full_name_str(), type_params.iter().format(", ")))
+          .variant(
+            &struct_env.get_full_name_str(),
+            field_names.iter().map(|x| &x[..])
+            .zip(
+              field_types.iter().map(|t| DatatypeAccessor::Sort(self.type_to_sort(t)))
+            ).collect()
+          )
+          .finish();
+        let resource_id = QualifiedInstId { module_id, inst: type_params.clone(), id: struct_id };
+        self.table.insert(resource_id, data_type);
+      }
+      _ => unreachable!(),
+    }
   }
 
   /// Turn a resource id to a Z3 datatype, memoized.
-  pub fn from_struct1(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) -> &DatatypeSort<'ctx> {
+  fn from_struct1(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) -> &DatatypeSort<'ctx> {
     let resource_id = QualifiedInstId { module_id, inst: type_params.clone(), id: struct_id };
     // cannot directly match self.table.get here, 
     if self.table.contains_key(&resource_id) {
       self.table.get(&resource_id).unwrap()
     } else {
-      self.update(module_id, struct_id, type_params.clone());
+      self.insert(module_id, struct_id, type_params.clone());
       self.from_struct1(module_id, struct_id, type_params)
     }
   }
 
   /// Turn a resource id to a Z3 datatype, memoized.
-  pub fn from_struct(&mut self, resource: &QualifiedInstId<StructId>) -> &DatatypeSort<'ctx> {
+  pub fn from_struct(&mut self, resource: &ResourceId) -> &DatatypeSort<'ctx> {
     self.from_struct1(resource.module_id, resource.id, resource.inst.clone())
   }
 
@@ -293,13 +324,11 @@ impl<'ctx, T: Clone> BitAnd<&Bool<'ctx>> for &Constrained<'ctx, T> {
 
 impl<'ctx, T: Display> Display for Constrained<'ctx, T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "({}, {})", self.content, self.constraint)
+    write!(f, "({} ↩ {})", self.content, self.constraint)
   }
 }
 
-/// Set of disjoint constrained values.
-pub type Union<'ctx> = Vec<ConstrainedValue<'ctx>>;
-
+/// Set of mutually exclusive constrained values.
 pub struct Disjoints<'ctx, T>(pub Vec<Constrained<'ctx, T>>);
 
 impl<'ctx> Disjoints<'ctx, Constraint<'ctx>> {
@@ -499,8 +528,19 @@ impl<'ctx> PrimitiveValue<'ctx> {
     }
   }
 
+  pub fn simplify(self) -> Self {
+    match self {
+      PrimitiveValue::Bool(x) => PrimitiveValue::Bool(x.simplify()),
+      PrimitiveValue::U8(x) => PrimitiveValue::U8(x.simplify()),
+      PrimitiveValue::U64(x) => PrimitiveValue::U64(x.simplify()),
+      PrimitiveValue::U128(x) => PrimitiveValue::U128(x.simplify()),
+      PrimitiveValue::Address(x) => PrimitiveValue::Address(x.simplify()),
+      PrimitiveValue::Signer(x) => PrimitiveValue::Signer(x.simplify()),
+    }
+  }
+
   /// Convert to the underlying ast.
-  pub fn to_ast(&self) -> &dyn Ast<'ctx> {
+  pub fn unwrap(&self) -> &dyn Ast<'ctx> {
     match self {
       PrimitiveValue::Bool(x) => x,
       PrimitiveValue::U8(x) => x,
@@ -613,6 +653,30 @@ impl<'ctx> Add for &PrimitiveValue<'ctx> {
       (PrimitiveValue::U8(x), PrimitiveValue::U8(y)) => PrimitiveValue::U8(x + y),
       (PrimitiveValue::U64(x), PrimitiveValue::U64(y)) => PrimitiveValue::U64(x + y),
       (PrimitiveValue::U128(x), PrimitiveValue::U128(y)) => PrimitiveValue::U128(x + y),
+      _ => panic!("Type mismatches."),
+    }
+  }
+}
+
+impl<'ctx> Sub for PrimitiveValue<'ctx> {
+  type Output = Self;
+  fn sub(self, rhs: Self) -> Self::Output {
+    match (self, rhs) {
+      (PrimitiveValue::U8(x), PrimitiveValue::U8(y)) => PrimitiveValue::U8(x - y),
+      (PrimitiveValue::U64(x), PrimitiveValue::U64(y)) => PrimitiveValue::U64(x - y),
+      (PrimitiveValue::U128(x), PrimitiveValue::U128(y)) => PrimitiveValue::U128(x - y),
+      _ => panic!("Type mismatches."),
+    }
+  }
+}
+
+impl<'ctx> Sub for &PrimitiveValue<'ctx> {
+  type Output = PrimitiveValue<'ctx>;
+  fn sub(self, rhs: Self) -> Self::Output {
+    match (self, rhs) {
+      (PrimitiveValue::U8(x), PrimitiveValue::U8(y)) => PrimitiveValue::U8(x - y),
+      (PrimitiveValue::U64(x), PrimitiveValue::U64(y)) => PrimitiveValue::U64(x - y),
+      (PrimitiveValue::U128(x), PrimitiveValue::U128(y)) => PrimitiveValue::U128(x - y),
       _ => panic!("Type mismatches."),
     }
   }
@@ -814,6 +878,34 @@ impl<'ctx> Value<'ctx> {
     }
   }
 
+  pub fn simplify(self) -> Self {
+    match self {
+      Value::Primitive(x) => Value::Primitive(x.simplify()),
+      Value::Struct(x) => Value::Struct(x.simplify()),
+      _ => unimplemented!(),
+    }
+  }
+
+  pub fn wrap(x: &Dynamic<'ctx>, t: &Type) -> Self {
+    match t {
+      Type::Primitive(pt) => {
+        match pt {
+          PrimitiveType::Address => Value::Primitive(PrimitiveValue::Address(x.as_bv().unwrap())),
+          PrimitiveType::Bool => Value::Primitive(PrimitiveValue::Bool(x.as_bool().unwrap())),
+          PrimitiveType::U8 => Value::Primitive(PrimitiveValue::U8(x.as_bv().unwrap())),
+          PrimitiveType::U64 => Value::Primitive(PrimitiveValue::U64(x.as_bv().unwrap())),
+          PrimitiveType::U128 => Value::Primitive(PrimitiveValue::U128(x.as_bv().unwrap())),
+          PrimitiveType::Signer => Value::Primitive(PrimitiveValue::Signer(x.as_bv().unwrap())),
+          _ => unreachable!(),
+        }
+      }
+      Type::Struct(_, _, _) => {
+        Value::Struct(x.as_datatype().unwrap())
+      }
+      _ => unimplemented!(),
+    }
+  }
+
   pub fn as_bool(&self) -> Option<&Bool<'ctx>> {
     match self {
       Value::Primitive(PrimitiveValue::Bool(x)) => Some(x),
@@ -836,9 +928,9 @@ impl<'ctx> Value<'ctx> {
     }
   }
 
-  pub fn to_ast(&self) -> &dyn Ast<'ctx> {
+  pub fn unwrap(&self) -> &dyn Ast<'ctx> {
     match self {
-      Value::Primitive(x) => x.to_ast(),
+      Value::Primitive(x) => x.unwrap(),
       Value::Struct(x) => x,
       Value::TypeParameter(x) => x,
     }
@@ -934,6 +1026,26 @@ impl<'ctx> Add for &Value<'ctx> {
   fn add(self, rhs: Self) -> Self::Output {
     match (self, rhs) {
       (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x + y),
+      _ => panic!("Type mismatches."),
+    }
+  }
+}
+
+impl<'ctx> Sub for Value<'ctx> {
+  type Output = Self;
+  fn sub(self, rhs: Self) -> Self::Output {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x - y),
+      _ => panic!("Type mismatches."),
+    }
+  }
+}
+
+impl<'ctx> Sub for &Value<'ctx> {
+  type Output = Value<'ctx>;
+  fn sub(self, rhs: Self) -> Self::Output {
+    match (self, rhs) {
+      (Value::Primitive(x), Value::Primitive(y)) => Value::Primitive(x - y),
       _ => panic!("Type mismatches."),
     }
   }
