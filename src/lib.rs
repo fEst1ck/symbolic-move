@@ -1,6 +1,8 @@
 pub mod state;
 pub mod value;
 pub mod evaluation;
+pub mod constraint;
+pub mod ty;
 
 use std::{io::Write, collections::BTreeMap};
 
@@ -40,7 +42,7 @@ pub fn test_fn<W: Write>(
       let config = Config::new();
       let ctx = Context::new(&config);
       let s = MoveState::new_default(&ctx, target);
-      println!("{:?}", s.offset_to_block_id);
+      // println!("{:?}", s.offset_to_block_id);
       let eval_res = eval(s);
       for mut s in eval_res {
         s.local_state = LocalState {

@@ -1,7 +1,9 @@
 //! # Evaluation State
-use crate::value::{
-    sat, BranchCondition, Constrained, ConstrainedValue, Constraint,
-    Datatypes, Disjoints, PrimitiveValue, Type, Value, ResourceId,
+use crate::{value::{
+    ConstrainedValue,
+    PrimitiveValue, Value,
+}, constraint::{Constrained, Constraint, sat, Disjoints},
+    ty::{Type, Datatypes, ResourceId},
 };
 use itertools::Itertools;
 use move_model::model::{
@@ -20,7 +22,7 @@ use std::{
 };
 use symbolic_evaluation::traits::{State, StateSet, Transition};
 use z3::{
-    ast::{Array, Ast, Bool, Datatype, BV},
+    ast::{Array, Ast, Bool, Datatype, BV, Dynamic},
     Context, Sort, Symbol,
 };
 
@@ -107,9 +109,9 @@ impl<'ctx> Local<'ctx> {
         }
     }
 
-    pub fn from_type<S: Into<Symbol>>(x: S, t: &Type, ctx: &'ctx Context) -> Self {
+    pub fn from_type<'env, S: Into<Symbol>>(x: S, t: &Type, ctx: &'ctx Context, datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>) -> Self {
         Self {
-            content: Disjoints(vec![ConstrainedValue::new_const(x, t, ctx)]),
+            content: Disjoints(vec![ConstrainedValue::new_const(x, t, ctx, datatypes)]),
         }
     }
 
@@ -372,7 +374,7 @@ impl<'ctx> GlobalState<'ctx> {
     ) -> Disjoints<'ctx, Constraint<'ctx>> {
         let resource_existence = self.get_resource_existence(resource_type);
         resource_existence
-            .filter_prod(addr)
+            .prod(addr)
             .map(|(array, value)| {
                 array
                     .select(value.as_addr().unwrap())
@@ -394,14 +396,14 @@ impl<'ctx> GlobalState<'ctx> {
             Some(resource_value_maps) => {
                 let resource_vals: Disjoints<'ctx, Datatype<'ctx>> = resource;
                 let new_resource_value_map = resource_value_maps
-                    .filter_prod(addrs)
-                    .filter_prod(&resource_vals)
+                    .prod(addrs)
+                    .prod(&resource_vals)
                     .map(|((array, addr), resource_val)| array.store(&addr, &resource_val));
                 let resource_existence_map: &Disjoints<Array> =
                     self.resource_existence.get(resource_type).unwrap(); // already inited when checking for existence
                 let new_resource_existence_map =
                     resource_existence_map
-                        .filter_prod(addrs)
+                        .prod(addrs)
                         .map(|(array, addr)| {
                             array.store(&addr, &Bool::from_bool(self.get_ctx(), true))
                         });
@@ -413,6 +415,35 @@ impl<'ctx> GlobalState<'ctx> {
             None => {
                 self.init_resource_value(datatypes.clone(), resource_type);
                 self.real_move_to(resource_type, addrs, resource, datatypes);
+            }
+        }
+    }
+
+    pub fn real_move_from<'env>(
+        &mut self,
+        resource_type: &ResourceId,
+        addrs: &Disjoints<'ctx, BV<'ctx>>,
+        datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>
+    ) -> Disjoints<'ctx, Dynamic<'ctx>> {
+        // update resource value map so that addr contains value
+        // update resource existence map so that addr contains true
+        match self.resource_value.get(resource_type) {
+            Some(resource_value_maps) => {
+                let ret_vals = resource_value_maps.prod(addrs).map(
+                    |(global_mem, addr)| global_mem.select(&addr)
+                );
+                let resource_existence_map: &Disjoints<Array> =
+                    self.resource_existence.get(resource_type).unwrap(); // already inited when checking for existence
+                let new_resource_existence_map = resource_existence_map
+                    .prod(addrs)
+                    .map(|(array, addr)| array.store(&addr, &Bool::from_bool(self.get_ctx(), false)));
+                self.resource_existence
+                    .insert(resource_type.clone(), new_resource_existence_map);
+                ret_vals
+            }
+            None => {
+                self.init_resource_value(datatypes.clone(), resource_type);
+                self.real_move_from(resource_type, addrs, datatypes)
             }
         }
     }
@@ -507,7 +538,41 @@ impl<'ctx, 'env> State for MoveState<'ctx, 'env> {
     }
 }
 
+/// A pair of disjoint constraints. So true_branch & false_branch is never satisfiable.
+pub struct BranchCondition<'ctx> {
+    pub true_branch: Constraint<'ctx>,
+    pub false_branch: Constraint<'ctx>,
+}
+  
+impl<'ctx> BitOr for BranchCondition<'ctx> {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+        (
+            BranchCondition { true_branch: t1, false_branch: f1 },
+            BranchCondition { true_branch: t2, false_branch: f2 },
+        ) => BranchCondition { true_branch: t1 | t2, false_branch: f1 | f2 },
+        }
+    }
+}
+
+impl<'ctx> BranchCondition<'ctx> {
+    /// The identity element of the | operation.
+    pub fn or_id(ctx: &'ctx Context) -> Self {
+        BranchCondition { true_branch: Bool::from_bool(ctx, false), false_branch: Bool::from_bool(ctx, false) }
+    }
+
+    /// Simplify fields.
+    pub fn simplify(self) -> Self {
+        match self {
+        BranchCondition { true_branch, false_branch } => BranchCondition { true_branch: true_branch.simplify(), false_branch: false_branch.simplify() }
+        }
+    }
+}
+
 mod eval {
+    use crate::ty::new_resource_id;
+
     use super::*;
     use move_stackless_bytecode::stackless_bytecode::{
         AbortAction, AssignKind, Constant, Operation,
@@ -693,13 +758,30 @@ mod eval {
                 let false_branch_local_state = s & branch_condition.false_branch.clone();
                 let mut false_branch_global_state = t.clone() & branch_condition.false_branch;
                 false_branch_global_state.real_move_to(&resource_type,
-                    &addr_val.map(|x| x.as_addr().unwrap().clone()),
+                    &false_branch_local_state[srcs[0]].content.clone().map(|x| x.as_addr().unwrap().clone()),
                     false_branch_local_state[srcs[1]].content.clone().map(|x| x.as_datatype().unwrap().clone()),
                     datatypes
                 );
                 vec![(true_branch_local_state, true_branch_global_state), (false_branch_local_state, false_branch_global_state)]
             }
-            // MoveFrom(ModuleId, StructId, Vec<Type>),
+            MoveFrom(module_id, struct_id, type_params) => {
+                let addr_val = s[srcs[0]].content.clone();
+                let resource_id = new_resource_id(*module_id, *struct_id, type_params.clone());
+                let branch_condition = t.exists(&resource_id, &addr_val).to_branch_condition(s.get_ctx());
+                let mut true_branch_local_state = s.clone() & branch_condition.true_branch.clone();
+                let mut true_branch_global_state = t.clone() & branch_condition.true_branch;
+                let resource_moved_out = true_branch_global_state.real_move_from(&resource_id,
+                    &true_branch_local_state[srcs[0]].content.clone().map(|x| x.as_addr().unwrap().clone()),
+                    datatypes
+                );
+                true_branch_local_state[dsts[0]].content = resource_moved_out.map(
+                    |x| Value::Struct(x.as_datatype().unwrap())
+                );
+                let mut false_branch_local_state = s & branch_condition.false_branch.clone();
+                false_branch_local_state.ts = TerminationStatus::Abort(Disjoints(vec![]));
+                let false_branch_global_state = t.clone() & branch_condition.false_branch;
+                vec![(true_branch_local_state, true_branch_global_state), (false_branch_local_state, false_branch_global_state)]
+            }
             Exists(module_id, struct_id, type_params) => {
                 let dst = dsts[0];
                 let src = srcs[0];
@@ -1016,6 +1098,7 @@ impl<'ctx, 'env> MoveState<'ctx, 'env> {
 impl<'ctx, 'env> MoveState<'ctx, 'env> {
     pub fn new_default(ctx: &'ctx Context, function_target: FunctionTarget<'env>) -> Self {
         let global_env = function_target.func_env.module_env.env;
+        let datatypes = Rc::new(RefCell::new(Datatypes::new(ctx, global_env)));
         Self {
             label_to_offset: Bytecode::label_offsets(function_target.data.code.as_slice()),
             offset_to_block_id: Self::generate_offset_to_block_id(
@@ -1030,7 +1113,7 @@ impl<'ctx, 'env> MoveState<'ctx, 'env> {
                     let local_name: String = symbol_pool.string(local_symbol).to_string();
                     let local_type = function_target.get_local_type(local_index);
                     locals.push(if local_index < function_target.get_parameter_count() {
-                        Local::from_type(local_name, &local_type, ctx)
+                        Local::from_type(local_name, &local_type, ctx, datatypes.clone())
                     } else {
                         Local::new()
                     });
@@ -1040,7 +1123,7 @@ impl<'ctx, 'env> MoveState<'ctx, 'env> {
             global_state: GlobalState::new_empty(ctx),
             function_target,
             // datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>
-            datatypes:  Rc::new(RefCell::new(Datatypes::new(ctx, global_env)))
+            datatypes: datatypes
         }
     }
 
