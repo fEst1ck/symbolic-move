@@ -1,4 +1,4 @@
-use std::{ops::{BitAnd, BitOr}, fmt::{Display, self}, iter::FromIterator};
+use std::{ops::{BitAnd}, fmt::{Display, self}, iter::FromIterator};
 
 use itertools::iproduct;
 use z3::{ast::{Bool, Ast}, Solver, SatResult, Context};
