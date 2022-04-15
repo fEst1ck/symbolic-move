@@ -14,12 +14,12 @@ use z3::{Context, Config};
 
 use crate::state::LocalState;
 
-pub fn get_module_env<'env>(global_env: &'env GlobalEnv, addr: &String, module_name: &String) -> Option<ModuleEnv<'env>>{
+fn get_module_env<'env>(global_env: &'env GlobalEnv, addr: &String, module_name: &String) -> Option<ModuleEnv<'env>>{
   let module_name = ModuleName::from_str(addr, global_env.symbol_pool().make(module_name));
   global_env.find_module(&module_name)
 }
 
-pub fn get_fn_by_name<'env>(module_env: &'env ModuleEnv, fn_name: &String) -> FunctionEnv<'env> {
+fn get_fn_by_name<'env>(module_env: &'env ModuleEnv, fn_name: &String) -> FunctionEnv<'env> {
   let fn_symbol = module_env.symbol_pool().make(fn_name);
   module_env.get_function(FunId::new(fn_symbol))
 }
@@ -27,6 +27,7 @@ pub fn get_fn_by_name<'env>(module_env: &'env ModuleEnv, fn_name: &String) -> Fu
 pub fn test_fn<W: Write>(
   move_sources: &[String], deps_dir: &[String],
   addr: String, module_name: String, function_name: String,
+  locals: bool,
   writer: &mut W
 ) -> std::io::Result<()> {
   let model_ = run_model_builder::<String, String>(
@@ -38,18 +39,22 @@ pub fn test_fn<W: Write>(
     if let Some(module) = get_module_env(&model, &addr, &module_name) {
       let fun_env = get_fn_by_name(&module, &function_name);
       let target = holder.get_target(&fun_env, &FunctionVariant::Verification(VerificationFlavor::Regular));
-      println!("testing\n{}", target);
+      writeln!(writer, "Testing function target:\n{}", target)?;
       let config = Config::new();
       let ctx = Context::new(&config);
       let s = MoveState::new_default(&ctx, target);
       // println!("{:?}", s.offset_to_block_id);
       let eval_res = eval(s);
-      for mut s in eval_res {
+      for (i, mut s) in eval_res.into_iter().enumerate() {
         s.local_state = LocalState {
           locals: s.local_state.locals.into_iter().map(|x| x.simplify()).collect(),
           ..s.local_state
         };
-        writeln!(writer, "Final state found:\n{}", s)?;
+        if locals {
+          writeln!(writer, "Evaluation result #{}:\n{}", i, s)?;
+        } else {
+          writeln!(writer, "Evaluation result #{}:\n{}", i, s.local_state.termination_status())?;
+        }
       }
     } else {
       writeln!(writer, "Module {}::{} not found.", &addr, module_name)?;

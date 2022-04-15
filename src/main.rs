@@ -7,9 +7,12 @@ use clap::Parser;
 #[clap(author, version, about, long_about = None)]
 struct Args {
     file: Vec<String>,
-    /// Evaluate a function
+    /// Name of the function target
     #[clap(short, long)]
     target: String,
+    /// Show local variables
+    #[clap(short, long)]
+    locals: bool,
 }
 
 fn main() -> Result<()> {
@@ -21,6 +24,7 @@ fn main() -> Result<()> {
   } else {
   test_fn(&args.file, &[],
     fun_name[0].to_string(), fun_name[1].to_string(), fun_name[2].to_string(),
+    args.locals,
     &mut stdout())
   }
 }
