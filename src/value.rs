@@ -1,8 +1,9 @@
 //! Symolic move values.
 
 use move_core_types::account_address::AccountAddress;
+use move_model::ast::TempIndex;
 use crate::{ty::{PrimitiveType, Type, Datatypes, new_resource_id}, state::BranchCondition};
-use move_stackless_bytecode::stackless_bytecode::Constant;
+use move_stackless_bytecode::stackless_bytecode::{Constant, BorrowNode, BorrowEdge};
 use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem, Sub}, fmt::{Display, self}, rc::Rc, cell::RefCell};
 use z3::{
   Context,
@@ -390,12 +391,16 @@ impl<'ctx> Not for &PrimitiveValue<'ctx> {
   }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Loc(pub BorrowNode, pub BorrowEdge);
+
 /// Symbolic move values.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Value<'ctx> {
   Primitive(PrimitiveValue<'ctx>),
   Struct(Datatype<'ctx>),
   TypeParameter(Dynamic<'ctx>),
+  Reference(Box<Value<'ctx>>, Option<Loc>),
 }
 
 impl<'ctx> Value<'ctx> {
@@ -478,6 +483,7 @@ impl<'ctx> Value<'ctx> {
       Value::Primitive(x) => x.unwrap(),
       Value::Struct(x) => x,
       Value::TypeParameter(x) => x,
+      _ => unimplemented!(),
     }
   }
 

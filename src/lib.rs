@@ -1,5 +1,6 @@
 pub mod state;
 pub mod value;
+pub mod dynamic;
 pub mod evaluation;
 pub mod constraint;
 pub mod ty;
