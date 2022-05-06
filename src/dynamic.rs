@@ -213,7 +213,7 @@ fn operation<'ctx, 'env>(
     fn rep_select<'ctx>(v: Dynamic<'ctx>, accessors: &[&FuncDecl<'ctx>]) -> Dynamic<'ctx> {
         accessors
             .iter()
-            .fold(v, |acc, accessor| accessor.apply(&[&acc]))
+            .fold(v, |acc, accessor| accessor.apply(&[&acc]).simplify())
     }
 
     fn root_type<'ctx, 'env>(
@@ -235,7 +235,6 @@ fn operation<'ctx, 'env>(
     ) -> Disjoints<'ctx, Value<'ctx>> {
         match root {
             Root::Global(resource_id, addr) => {
-                let resource_type = datatypes.borrow().get_resource_type(resource_id.clone());
                 t.get_resource_value(&resource_id, datatypes)
                     .map(|addr_to_resource_val| {
                         Value::Struct(addr_to_resource_val.select(&addr).as_datatype().unwrap())
@@ -403,7 +402,7 @@ fn operation<'ctx, 'env>(
             vec![(s, t)]
         }
         // BorrowField(ModuleId, StructId, Vec<Type>, usize),
-        BorrowField(module_id, struct_id, type_params, field_id) => {
+        BorrowField(_, _, _, field_id) => {
             s[dsts[0]].content = s[srcs[0]].content.clone().map(|x| match x {
                 Value::Reference(Loc { root, access_path }) => {
                     let mut new_access_path = access_path;
@@ -440,7 +439,7 @@ fn operation<'ctx, 'env>(
             let accessor = &accessors[*field_num];
             let dst_type = &s[dsts[0]].ty;
             s[dsts[0]].content = s[srcs[0]].content.clone().map(|x| {
-                let unwrapped_res = accessor.apply(&[&x.as_dynamic()]);
+                let unwrapped_res = accessor.apply(&[&x.as_dynamic()]).simplify();
                 Value::wrap(&unwrapped_res, dst_type)
             });
             vec![(s, t)]
@@ -506,27 +505,27 @@ fn operation<'ctx, 'env>(
                                 datatype.borrow().get_field_types(*mod_id, *struct_id),
                                 type_params,
                             );
-                            let mut foo = datatype.borrow_mut();
-                            let (constructor, destructors) = foo.pack_unpack(&root_ty).unwrap();
+                            let foo = datatype.borrow();
+                            let (constructor, destructors) = foo.pack_unpack_(&root_ty).unwrap();
                             let fields: Vec<_> = destructors
                                 .iter()
                                 .enumerate()
                                 .map(|(field_num, destructor)| {
                                     if field_num == access_path[0] {
                                         local_write_ref(
-                                            destructor.apply(&[&root_val]),
+                                            destructor.apply(&[&root_val]).simplify(),
                                             &field_types[field_num],
                                             &access_path[1..],
                                             hyper_field_val.clone(),
                                             datatype.clone(),
                                         )
                                     } else {
-                                        destructor.apply(&[&root_val])
+                                        destructor.apply(&[&root_val]).simplify()
                                     }
                                 })
                                 .collect();
                             let fields_ = &fields.iter().map(|x| x as &dyn Ast).collect::<Vec<_>>();
-                            constructor.apply(fields_)
+                            constructor.apply(fields_).simplify()
                         }
                         _ => unreachable!(),
                     }
@@ -548,6 +547,7 @@ fn operation<'ctx, 'env>(
                         let root_vals =
                             read_ref_root(&s, t.clone(), root.clone(), datatypes.clone());
                         let root_ty = root_type(&s, root.clone(), datatypes.clone());
+                        access_path_tys(root_ty.clone(), &access_path, &mut datatypes.borrow_mut());
                         let new_local_val = root_vals.map(|root_val| {
                             let dyn_val = local_write_ref(
                                 root_val.as_dynamic(),
@@ -562,11 +562,12 @@ fn operation<'ctx, 'env>(
                         (s, t)
                     }
                     Root::Global(resource_id, addr) => {
+                        let root_ty = root_type(&s, root.clone(), datatypes.clone());
+                        access_path_tys(root_ty.clone(), &access_path, &mut datatypes.borrow_mut());
                         let updated_global_mem = t
                             .get_resource_value(&resource_id, datatypes.clone())
                             .map(|addr_resource| {
                                 let root_val = addr_resource.select(&addr);
-                                let root_ty = root_type(&s, root.clone(), datatypes.clone());
                                 let raw_val = local_write_ref(
                                     root_val,
                                     &root_ty,
@@ -582,7 +583,6 @@ fn operation<'ctx, 'env>(
                 }
             }
 
-            let num_locals = s.locals.len();
             let res = s[srcs[0]]
                 .content
                 .clone()
@@ -632,7 +632,7 @@ fn operation<'ctx, 'env>(
         // Havoc(HavocKind),
         // Stop,
         // Memory model
-        IsParent(BorrowNode, BorrowEdge) => {
+        IsParent(_, _) => {
             let ctx = s.get_ctx();
             use z3::ast::Bool;
             s[dsts[0]].content = Disjoints(vec![Constrained::new(

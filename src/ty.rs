@@ -116,7 +116,7 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
   // should only be called when `t` is cached!
   pub fn pack(&self, t: &Type) -> Option<&FuncDecl<'ctx>> {
     match t {
-      Type::Struct(mod_id, struct_id, type_params) => {
+      Type::Struct(_, _, _) => {
         // if !self.table.contains_key(t) {
         //   self.insert(*mod_id, *struct_id, type_params.clone());
         // }
@@ -129,7 +129,7 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
   // should only be called when `t` is cached!
   pub fn unpack(&self, t: &Type) -> Option<&Vec<FuncDecl<'ctx>>> {
     match t {
-      Type::Struct(mod_id, struct_id, type_params) => {
+      Type::Struct(_, _, _) => {
         // if !self.table.contains_key(t) {
         //   self.insert(*mod_id, *struct_id, type_params.clone());
         // }
@@ -152,6 +152,12 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
     }
       _ => None,
     }
+  }
+
+  // should only be called when `t` is cached!
+  pub fn pack_unpack_(&self, t: &Type) -> Option<(&FuncDecl<'ctx>, &Vec<FuncDecl<'ctx>>)> {
+    self.table.get(t).map(|x| 
+      (&x.variants[0].constructor, &x.variants[0].accessors))
   }
 }
 

@@ -429,9 +429,9 @@ impl<'ctx> Value<'ctx> {
         let data_type = datatypes_mut_ref.from_struct(&new_resource_id(*module_id, *struct_id, type_params.clone()));
         Value::Struct(Datatype::new_const(&ctx, x, &data_type.sort))
       }
-      Type::TypeParameter(x) =>
+      Type::TypeParameter(_) =>
         unimplemented!(),
-      Type::Reference(_, ty) => todo!(),
+      Type::Reference(_, _) => todo!(),
       _ => unimplemented!(),
     }
   }
@@ -559,7 +559,6 @@ impl<'ctx> Value<'ctx> {
       (Value::Struct(x), Value::Struct(y)) => Value::Primitive(PrimitiveValue::Bool(x._eq(y))),
       (Value::TypeParameter(x), Value::TypeParameter(y)) => Value::Primitive(PrimitiveValue::Bool(x._eq(y))),
       _ => todo!(),
-      _ => panic!("Type mismatches."),
     }
   }
 
