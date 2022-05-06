@@ -2,8 +2,8 @@
 
 use move_core_types::account_address::AccountAddress;
 use move_model::ast::TempIndex;
-use crate::{ty::{PrimitiveType, Type, Datatypes, new_resource_id}, state::BranchCondition};
-use move_stackless_bytecode::stackless_bytecode::{Constant, BorrowNode, BorrowEdge};
+use crate::{ty::{PrimitiveType, Type, Datatypes, new_resource_id, ResourceId}, state::BranchCondition};
+use move_stackless_bytecode::stackless_bytecode::{Constant};
 use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem, Sub}, fmt::{Display, self}, rc::Rc, cell::RefCell};
 use z3::{
   Context,
@@ -392,7 +392,16 @@ impl<'ctx> Not for &PrimitiveValue<'ctx> {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Loc(pub BorrowNode, pub BorrowEdge);
+pub enum Root<'ctx> {
+  Global(ResourceId, BV<'ctx>),
+  Local(TempIndex),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Loc<'ctx> {
+  pub root: Root<'ctx>,
+  pub access_path: Vec<usize>,
+}
 
 /// Symbolic move values.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -400,7 +409,7 @@ pub enum Value<'ctx> {
   Primitive(PrimitiveValue<'ctx>),
   Struct(Datatype<'ctx>),
   TypeParameter(Dynamic<'ctx>),
-  Reference(Box<Value<'ctx>>, Option<Loc>),
+  Reference(Loc<'ctx>),
 }
 
 impl<'ctx> Value<'ctx> {
@@ -422,6 +431,7 @@ impl<'ctx> Value<'ctx> {
       }
       Type::TypeParameter(x) =>
         unimplemented!(),
+      Type::Reference(_, ty) => todo!(),
       _ => unimplemented!(),
     }
   }
@@ -431,6 +441,7 @@ impl<'ctx> Value<'ctx> {
     match self {
       Value::Primitive(x) => Value::Primitive(x.simplify()),
       Value::Struct(x) => Value::Struct(x.simplify()),
+      Value::Reference(x) => Value::Reference(x), // todo: maybe need to simpl when x is a global ref
       _ => unimplemented!(),
     }
   }
@@ -483,9 +494,15 @@ impl<'ctx> Value<'ctx> {
       Value::Primitive(x) => x.unwrap(),
       Value::Struct(x) => x,
       Value::TypeParameter(x) => x,
-      _ => unimplemented!(),
+      // Value::Reference(x, _) => (*x.as_ref()).unwrap(),
+      _ => todo!(),
     }
   }
+
+    /// Reference to the wrapped z3 ast.
+    pub fn as_dynamic(self) -> Dynamic<'ctx> {
+      Dynamic::from_ast(self.unwrap())
+    }
 
   /// Arithmetic less than.
   pub fn lt(&self, rhs: &Self) -> Self {

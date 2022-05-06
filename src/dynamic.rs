@@ -7,19 +7,22 @@ use std::{
 
 use move_model::model::QualifiedInstId;
 use move_stackless_bytecode::stackless_bytecode::{
-    AbortAction, AssignKind, Bytecode, Constant, Label, Operation, BorrowNode, BorrowEdge,
+    AbortAction, AssignKind, Bytecode, Constant, Label, Operation,
 };
 use symbolic_evaluation::traits::Transition;
-use z3::{ast::Ast, Context};
+use z3::{
+    ast::{Ast, Dynamic},
+    Context, FuncDecl,
+};
 
 use crate::{
     constraint::{Constrained, Disjoints},
     state::{
-        BranchCondition, CodeOffset, GlobalState, LocalState, MoveState, TempIndex,
+        BranchCondition, CodeOffset, GlobalState, Local, LocalState, MoveState, TempIndex,
         TerminationStatus,
     },
-    ty::{new_resource_id, Datatypes},
-    value::{ConstrainedValue, PrimitiveValue, Value, Loc},
+    ty::{new_resource_id, Datatypes, FieldId, Type},
+    value::{ConstrainedValue, Loc, PrimitiveValue, Root, Value},
 };
 
 // Evaluate an `Assign`.
@@ -136,6 +139,127 @@ fn operation<'ctx, 'env>(
     mut t: GlobalState<'ctx>,
     datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>,
 ) -> Vec<(LocalState<'ctx>, GlobalState<'ctx>)> {
+    fn accessors_along_path<'ctx, 'env, 'a>(
+        mut root_type: Type,
+        access_path: &[usize],
+        datatype: &'a mut Datatypes<'ctx, 'env>,
+    ) -> Option<Vec<&'a FuncDecl<'ctx>>> {
+        access_path_tys(root_type.clone(), access_path, datatype);
+        let mut res = Vec::new();
+        for &edge in access_path {
+            match root_type.clone() {
+                Type::Struct(mod_id, struct_id, type_params) => {
+                    let accessor = datatype.unpack(&root_type).unwrap().index(edge);
+                    res.push(accessor);
+                    let field_types = Type::instantiate_vec(
+                        datatype.get_field_types(mod_id, struct_id),
+                        &type_params,
+                    );
+                    root_type = field_types[edge].clone();
+                }
+                _ => return None,
+            }
+        }
+        Some(res)
+    }
+
+    fn access_path_ty<'ctx, 'env, 'a, 'b>(
+        root_type: Type,
+        access_path: &[usize],
+        datatype: &'a Datatypes<'ctx, 'env>,
+    ) -> Option<Type> {
+        if access_path.is_empty() {
+            Some(root_type)
+        } else {
+            match root_type {
+                Type::Struct(mod_id, struct_id, type_params) => {
+                    let field_types = Type::instantiate_vec(
+                        datatype.get_field_types(mod_id, struct_id),
+                        &type_params,
+                    );
+                    access_path_ty(
+                        field_types[access_path[0]].clone(),
+                        &access_path[1..],
+                        datatype,
+                    )
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn access_path_tys<'ctx, 'env, 'a, 'b>(
+        mut root_type: Type,
+        access_path: &[usize],
+        datatype: &'a mut Datatypes<'ctx, 'env>,
+    ) {
+        for &edge in access_path {
+            match root_type {
+                Type::Struct(module_id, struct_id, type_params) => {
+                    datatype.insert(module_id, struct_id, type_params.clone());
+                    let field_types = Type::instantiate_vec(
+                        datatype.get_field_types(module_id, struct_id),
+                        &type_params,
+                    );
+                    root_type = field_types[edge].clone();
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    // accessors = f, g, ...
+    // out: (... (g (f v)) ...)
+    fn rep_select<'ctx>(v: Dynamic<'ctx>, accessors: &[&FuncDecl<'ctx>]) -> Dynamic<'ctx> {
+        accessors
+            .iter()
+            .fold(v, |acc, accessor| accessor.apply(&[&acc]))
+    }
+
+    fn root_type<'ctx, 'env>(
+        s: &LocalState<'ctx>,
+        root: Root<'ctx>,
+        datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>,
+    ) -> Type {
+        match root {
+            Root::Global(resource_id, _) => datatypes.borrow().get_resource_type(resource_id),
+            Root::Local(local_index) => s[local_index].ty.clone(),
+        }
+    }
+
+    fn read_ref_root<'env, 'ctx>(
+        s: &LocalState<'ctx>,
+        mut t: GlobalState<'ctx>,
+        root: Root<'ctx>,
+        datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>,
+    ) -> Disjoints<'ctx, Value<'ctx>> {
+        match root {
+            Root::Global(resource_id, addr) => {
+                let resource_type = datatypes.borrow().get_resource_type(resource_id.clone());
+                t.get_resource_value(&resource_id, datatypes)
+                    .map(|addr_to_resource_val| {
+                        Value::Struct(addr_to_resource_val.select(&addr).as_datatype().unwrap())
+                    })
+            }
+            Root::Local(local_index) => s[local_index].content.clone(),
+        }
+    }
+
+    fn read_ref<'env, 'ctx>(
+        s: &LocalState<'ctx>,
+        t: GlobalState<'ctx>,
+        loc: Loc<'ctx>,
+        root_type: &Type,
+        datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>,
+    ) -> Disjoints<'ctx, Dynamic<'ctx>> {
+        let Loc { root, access_path } = loc;
+        let root_val = read_ref_root(s, t, root.clone(), datatypes.clone()).map(|x| x.as_dynamic());
+        let datatypes_borrow = &mut datatypes.borrow_mut();
+        let accessors =
+            accessors_along_path(root_type.clone(), &access_path, datatypes_borrow).unwrap();
+        root_val.map(|x| rep_select(x, &accessors[..]))
+    }
+
     use Operation::*;
     s.ic += 1;
     match op {
@@ -269,73 +393,260 @@ fn operation<'ctx, 'env>(
         // Borrow
         // BorrowLoc,
         BorrowLoc => {
-          let src = srcs[0];
-          let src_val = s[src].content.clone();
-          s[dsts[0]].content = src_val.map(
-            |v| Value::Reference(
-              Box::new(v),
-              Some(
-                Loc(BorrowNode::LocalRoot(src), BorrowEdge::Direct)
-              )
-            )
-          );
-          vec![(s, t)]
+            s[dsts[0]].content = Disjoints(vec![Constrained::new(
+                Value::Reference(Loc {
+                    root: Root::Local(srcs[0]),
+                    access_path: Vec::new(),
+                }),
+                s.pc.clone(),
+            )]);
+            vec![(s, t)]
         }
         // BorrowField(ModuleId, StructId, Vec<Type>, usize),
         BorrowField(module_id, struct_id, type_params, field_id) => {
-          pure_local_operation_(
-            dsts,
-            |x| {
-              assert_eq!(x.len(), 1);
-              let resource_type = new_resource_id(*module_id, *struct_id, type_params.clone());
-              let field_types = datatypes.borrow().get_field_types(*module_id, *struct_id);
-              let mut dt = datatypes.borrow_mut();
-              let struct_sort = dt.from_struct(&resource_type);
-              let field_accessor = &struct_sort.variants[0]
-                  .accessors[*field_id];
-              let field_val = field_accessor.apply(&[x[0].unwrap()]);
-              vec![
-                Value::Reference(
-                  Box::new(Value::wrap(&field_val, &field_types[*field_id])),
-                  Some(Loc(BorrowNode::Reference(srcs[0]), BorrowEdge::Field(resource_type, *field_id)))
-                )
-              ]
-            },
-            srcs,
-            s,
-            t
-          )
+            s[dsts[0]].content = s[srcs[0]].content.clone().map(|x| match x {
+                Value::Reference(Loc { root, access_path }) => {
+                    let mut new_access_path = access_path;
+                    new_access_path.push(*field_id);
+                    Value::Reference(Loc {
+                        root,
+                        access_path: new_access_path,
+                    })
+                }
+                _ => unreachable!(),
+            });
+            vec![(s, t)]
         }
         // BorrowGlobal(ModuleId, StructId, Vec<Type>),
         BorrowGlobal(module_id, struct_id, type_params) => {
-          let addr_val = s[srcs[0]].content.clone();
-          let resource_id = new_resource_id(*module_id, *struct_id, type_params.clone());
-          let branch_condition = t
-              .exists(&resource_id, &addr_val)
-              .to_branch_condition(s.get_ctx());
-          let mut true_branch_local_state = s.clone() & branch_condition.true_branch.clone();
-          let mut true_branch_global_state = t.clone() & branch_condition.true_branch;
-          let addr_to_resource = true_branch_global_state.get_resource_value(&resource_id, datatypes);
-          let addr = true_branch_local_state[srcs[0]].content.clone().map(|x| x.as_addr().unwrap().clone());
-          let resource = addr_to_resource.prod(&addr).map(
-            |(array, addr)| Value::Struct(array.select(&addr).as_datatype().unwrap())
-          );
-          let resouce_ref = resource.map(
-            |x| Value::Reference(
-              Box::new(x),
-              Some(Loc(BorrowNode::GlobalRoot(resource_id.clone()), BorrowEdge::Direct)),
-            )
-          );
-          true_branch_local_state[dsts[0]].content = resouce_ref;
-          let mut false_branch_local_state = s & branch_condition.false_branch.clone();
-          false_branch_local_state.ts = TerminationStatus::Abort(Disjoints(vec![]));
-          let false_branch_global_state = t.clone() & branch_condition.false_branch;
-          vec![
-              (true_branch_local_state, true_branch_global_state),
-              (false_branch_local_state, false_branch_global_state),
-          ]
+            s[dsts[0]].content = s[srcs[0]].content.clone().map(|x| {
+                Value::Reference(Loc {
+                    root: Root::Global(
+                        new_resource_id(*module_id, *struct_id, type_params.clone()),
+                        x.as_addr().unwrap().clone(),
+                    ),
+                    access_path: Vec::new(),
+                })
+            });
+            vec![(s, t)]
         }
+        // Get
+        GetField(mod_id, struct_id, type_params, field_num) => {
+            let mut datatypes_mut = datatypes
+            .borrow_mut();
+            let (_, accessors) = datatypes_mut
+                .pack_unpack(&Type::Struct(*mod_id, *struct_id, type_params.clone()))
+                .unwrap();
+            let accessor = &accessors[*field_num];
+            let dst_type = &s[dsts[0]].ty;
+            s[dsts[0]].content = s[srcs[0]].content.clone().map(|x| {
+                let unwrapped_res = accessor.apply(&[&x.as_dynamic()]);
+                Value::wrap(&unwrapped_res, dst_type)
+            });
+            vec![(s, t)]
+        }
+        GetGlobal(mod_id, struct_id, type_params) => {
+            let addr_val = s[srcs[0]].content.clone();
+            let resource_id = new_resource_id(*mod_id, *struct_id, type_params.clone());
+            let branch_condition = t
+                .exists(&resource_id, &addr_val)
+                .to_branch_condition(s.get_ctx());
+            let mut true_branch_local_state = s.clone() & branch_condition.true_branch.clone();
+            let mut true_branch_global_state = t.clone() & branch_condition.true_branch;
+            let resource_moved_out = true_branch_global_state.real_move_from_(
+                &resource_id,
+                &true_branch_local_state[srcs[0]]
+                    .content
+                    .clone()
+                    .map(|x| x.as_addr().unwrap().clone()),
+                datatypes,
+            );
+            true_branch_local_state[dsts[0]].content =
+                resource_moved_out.map(|x| Value::Struct(x.as_datatype().unwrap()));
+            let mut false_branch_local_state = s & branch_condition.false_branch.clone();
+            false_branch_local_state.ts = TerminationStatus::Abort(Disjoints(vec![]));
+            let false_branch_global_state = t.clone() & branch_condition.false_branch;
+            vec![
+                (true_branch_local_state, true_branch_global_state),
+                (false_branch_local_state, false_branch_global_state),
+            ]
+        }
+        // Builtins
+        // Destroy,
+        ReadRef => {
+            let refs = s[srcs[0]].content.clone();
+            let ref_val = refs
+                .map(|x| match x {
+                    Value::Reference(loc) => {
+                        let root_ty = root_type(&s, loc.root.clone(), datatypes.clone());
+                        let ref_ty =
+                            access_path_ty(root_ty.clone(), &loc.access_path, &datatypes.borrow());
+                        read_ref(&s, t.clone(), loc.clone(), &root_ty, datatypes.clone())
+                            .map(|x| Value::wrap(&x, &ref_ty.clone().unwrap()))
+                    }
+                    _ => unreachable!(),
+                })
+                .flatten();
+            s[dsts[0]].content = ref_val;
+            vec![(s, t)]
+        }
+        // WriteRef,
+        WriteRef => {
+            fn local_write_ref<'ctx, 'env>(
+                root_val: Dynamic<'ctx>,
+                root_ty: &Type,
+                access_path: &[FieldId],
+                hyper_field_val: Dynamic<'ctx>,
+                datatype: Rc<RefCell<Datatypes<'ctx, 'env>>>,
+            ) -> Dynamic<'ctx> {
+                if !access_path.is_empty() {
+                    match root_ty {
+                        Type::Struct(mod_id, struct_id, type_params) => {
+                            let field_types = Type::instantiate_vec(
+                                datatype.borrow().get_field_types(*mod_id, *struct_id),
+                                type_params,
+                            );
+                            let mut foo = datatype.borrow_mut();
+                            let (constructor, destructors) = foo.pack_unpack(&root_ty).unwrap();
+                            let fields: Vec<_> = destructors
+                                .iter()
+                                .enumerate()
+                                .map(|(field_num, destructor)| {
+                                    if field_num == access_path[0] {
+                                        local_write_ref(
+                                            destructor.apply(&[&root_val]),
+                                            &field_types[field_num],
+                                            &access_path[1..],
+                                            hyper_field_val.clone(),
+                                            datatype.clone(),
+                                        )
+                                    } else {
+                                        destructor.apply(&[&root_val])
+                                    }
+                                })
+                                .collect();
+                            let fields_ = &fields.iter().map(|x| x as &dyn Ast).collect::<Vec<_>>();
+                            constructor.apply(fields_)
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    hyper_field_val
+                }
+            }
 
+            fn write_ref<'ctx, 'env>(
+                loc: Loc<'ctx>,
+                x: Value<'ctx>,
+                mut s: LocalState<'ctx>,
+                mut t: GlobalState<'ctx>,
+                datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>,
+            ) -> (LocalState<'ctx>, GlobalState<'ctx>) {
+                let Loc { root, access_path } = loc;
+                match root.clone() {
+                    Root::Local(local_index) => {
+                        let root_vals =
+                            read_ref_root(&s, t.clone(), root.clone(), datatypes.clone());
+                        let root_ty = root_type(&s, root.clone(), datatypes.clone());
+                        let new_local_val = root_vals.map(|root_val| {
+                            let dyn_val = local_write_ref(
+                                root_val.as_dynamic(),
+                                &root_ty,
+                                &access_path,
+                                x.clone().as_dynamic(),
+                                datatypes.clone(),
+                            );
+                            Value::wrap(&dyn_val, &root_ty)
+                        });
+                        s[local_index].content = new_local_val;
+                        (s, t)
+                    }
+                    Root::Global(resource_id, addr) => {
+                        let updated_global_mem = t
+                            .get_resource_value(&resource_id, datatypes.clone())
+                            .map(|addr_resource| {
+                                let root_val = addr_resource.select(&addr);
+                                let root_ty = root_type(&s, root.clone(), datatypes.clone());
+                                let raw_val = local_write_ref(
+                                    root_val,
+                                    &root_ty,
+                                    &access_path,
+                                    x.clone().as_dynamic(),
+                                    datatypes.clone(),
+                                );
+                                addr_resource.store(&addr, &raw_val.as_datatype().unwrap())
+                            });
+                        t.resource_value.insert(resource_id, updated_global_mem);
+                        (s, t)
+                    }
+                }
+            }
+
+            let num_locals = s.locals.len();
+            let res = s[srcs[0]]
+                .content
+                .clone()
+                .prod(&s[srcs[1]].content)
+                .map(|(ref_, val)| {
+                    if let Value::Reference(loc) = ref_ {
+                        write_ref(loc, val, s.clone(), t.clone(), datatypes.clone())
+                    } else {
+                        unreachable!()
+                    }
+                })
+                .0
+                .into_iter()
+                .map(
+                    |Constrained {
+                         content: (s, t),
+                         constraint,
+                     }| { (s & constraint.clone(), t & constraint) },
+                )
+                .fold(
+                    (
+                        LocalState {
+                            context: s.get_ctx(),
+                            ic: s.ic,
+                            pc: s.pc.clone(),
+                            ts: s.ts.clone(),
+                            locals: s
+                                .locals
+                                .iter()
+                                .map(|x| Local {
+                                    ty: x.ty.clone(),
+                                    content: Disjoints(Vec::new()),
+                                })
+                                .collect(),
+                        },
+                        GlobalState {
+                            ctx: t.ctx,
+                            resource_value: BTreeMap::new(),
+                            resource_existence: BTreeMap::new(),
+                        },
+                    ),
+                    |(s, t), (s_, t_)| (s.merge(s_), t.merge(t_)),
+                );
+            vec![res]
+        }
+        // FreezeRef,
+        // Havoc(HavocKind),
+        // Stop,
+        // Memory model
+        IsParent(BorrowNode, BorrowEdge) => {
+            let ctx = s.get_ctx();
+            use z3::ast::Bool;
+            s[dsts[0]].content = Disjoints(vec![Constrained::new(
+                Value::Primitive(PrimitiveValue::Bool(Bool::from_bool(ctx, false))),
+                s.pc.clone(),
+            )]);
+            vec![(s, t)]
+        }
+        // WriteBack(BorrowNode, BorrowEdge),
+        WriteBack(_, _) => vec![(s, t)],
+        // UnpackRef,
+        // PackRef,
+        // UnpackRefDeep,
+        // PackRefDeep,
         // Unary
         // CastU8 => todo!
         // CastU64 => todo!
@@ -436,7 +747,6 @@ fn operation<'ctx, 'env>(
         Lt => pure_local_operation_(
             dsts,
             |x| {
-                println!("fjdkf");
                 assert_eq!(x.len(), 2);
                 vec![x[0].lt(&x[1])]
             },

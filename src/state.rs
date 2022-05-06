@@ -7,7 +7,7 @@ use crate::{value::{
 };
 use itertools::Itertools;
 use move_model::model::{
-    FunctionEnv, GlobalEnv, QualifiedInstId,
+    FunctionEnv, GlobalEnv,
 };
 use move_stackless_bytecode::{
     function_target::{FunctionData, FunctionTarget},
@@ -70,6 +70,7 @@ impl<'ctx> TerminationStatus<'ctx> {
 /// Local variable
 #[derive(Clone)]
 pub struct Local<'ctx> {
+    pub ty: Type,
     pub(crate) content: Disjoints<'ctx, Value<'ctx>>,
 }
 
@@ -84,7 +85,7 @@ impl<'ctx> BitAnd<Bool<'ctx>> for Local<'ctx> {
     type Output = Self;
 
     fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
-        Local { content: self.content & rhs }
+        Local { content: self.content & rhs, ..self }
     }
 }
 
@@ -97,20 +98,23 @@ impl<'ctx> BitOr<Local<'ctx>> for Local<'ctx> {
 }
 
 impl<'ctx> Local<'ctx> {
-    pub fn new() -> Self {
+    pub fn new(ty: Type) -> Self {
         Self {
+            ty,
             content: Disjoints(Vec::new()),
         }
     }
 
     pub fn simplify(self) -> Self {
         Self {
-            content: self.content.into_iter().map(|x| x.simplify()).collect()
+            content: self.content.into_iter().map(|x| x.simplify()).collect(),
+            ..self
         }
     }
 
     pub fn from_type<'env, S: Into<Symbol>>(x: S, t: &Type, ctx: &'ctx Context, datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>) -> Self {
         Self {
+            ty: t.clone(),
             content: Disjoints(vec![ConstrainedValue::new_const(x, t, ctx, datatypes)]),
         }
     }
@@ -152,6 +156,10 @@ impl<'ctx> Local<'ctx> {
         }
         if self.len() == other.len() {
             Self {
+                ty: {
+                    assert!(self.ty == other.ty);
+                    self.ty
+                },
                 content: Disjoints(merge_content(self.content.0, other.content.0)),
             }
         } else {
@@ -254,6 +262,21 @@ impl<'ctx> LocalState<'ctx> {
         }
     }
 
+    pub fn merge(self, other: Self) -> Self {
+        LocalState {
+            pc: (&self.pc | &other.pc).simplify(),
+            locals: {
+                self
+                    .locals
+                    .into_iter()
+                    .zip(other.locals.into_iter())
+                    .map(|(x, y)| (x | y).simplify())
+                    .collect()
+            },
+            ..self
+        }
+    }
+
     /// Return constrained tuples of operation arguments.
     pub fn args(&self, srcs: &[TempIndex]) -> Disjoints<'ctx, Vec<Value<'ctx>>> {
         srcs
@@ -303,7 +326,7 @@ impl<'ctx> ConstrainedBool<'ctx> {
 /// Global evaluation state
 #[derive(Clone)]
 pub struct GlobalState<'ctx> {
-    ctx: &'ctx Context,
+    pub ctx: &'ctx Context,
     pub resource_value: BTreeMap<ResourceId, Disjoints<'ctx, Array<'ctx>>>,
     pub resource_existence: BTreeMap<ResourceId, Disjoints<'ctx, Array<'ctx>>>,
 }
@@ -314,6 +337,24 @@ impl<'ctx> GlobalState<'ctx> {
             ctx,
             resource_value: BTreeMap::new(),
             resource_existence: BTreeMap::new(),
+        }
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        fn merge<'ctx>(x: BTreeMap<ResourceId, Disjoints<'ctx, Array<'ctx>>>, y: BTreeMap<ResourceId, Disjoints<'ctx, Array<'ctx>>>) -> BTreeMap<ResourceId, Disjoints<'ctx, Array<'ctx>>> {
+            let mut res = x;
+            for (resource_id, mut disjoints) in y {
+                res.entry(resource_id)
+                    .and_modify(|x| x.0.append(&mut disjoints.0))
+                    .or_insert(disjoints);
+            }
+            res
+        }
+        assert!(self.ctx == other.ctx);
+        GlobalState { 
+            ctx: self.ctx,
+            resource_value: merge(self.resource_value, other.resource_value),
+            resource_existence: merge(self.resource_existence, other.resource_existence)
         }
     }
 
@@ -461,6 +502,28 @@ impl<'ctx> GlobalState<'ctx> {
             }
         }
     }
+
+    pub fn real_move_from_<'env>(
+        &mut self,
+        resource_type: &ResourceId,
+        addrs: &Disjoints<'ctx, BV<'ctx>>,
+        datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>
+    ) -> Disjoints<'ctx, Dynamic<'ctx>> {
+        // update resource value map so that addr contains value
+        // update resource existence map so that addr contains true
+        match self.resource_value.get(resource_type) {
+            Some(resource_value_maps) => {
+                let ret_vals = resource_value_maps.prod(addrs).map(
+                    |(global_mem, addr)| global_mem.select(&addr)
+                );
+                ret_vals
+            }
+            None => {
+                self.init_resource_value(datatypes.clone(), resource_type);
+                self.real_move_from(resource_type, addrs, datatypes)
+            }
+        }
+    }
 }
 
 impl<'ctx> BitAnd<Bool<'ctx>> for GlobalState<'ctx> {
@@ -544,6 +607,7 @@ impl<'ctx, 'env> State for MoveState<'ctx, 'env> {
                     },
                     ..self.local_state
                 },
+                global_state: self.global_state.merge(other.global_state),
                 ..self
             })
         } else {
@@ -623,14 +687,13 @@ impl<'ctx, 'env> MoveState<'ctx, 'env> {
                     locals.push(if local_index < function_target.get_parameter_count() {
                         Local::from_type(local_name, &local_type, ctx, datatypes.clone())
                     } else {
-                        Local::new()
+                        Local::new(local_type.clone())
                     });
                 }
                 locals
             }),
             global_state: GlobalState::new_empty(ctx),
             function_target,
-            // datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>
             datatypes: datatypes
         }
     }

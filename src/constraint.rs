@@ -240,6 +240,21 @@ pub fn fmap2_disjoints<'ctx, A: Clone, B: Clone, C, F>(f: F, args: (&Disjoints<'
   arg.map(f)
 }
 
+impl<'ctx, T> Disjoints<'ctx, Disjoints<'ctx, T>> {
+  pub fn flatten(self) -> Disjoints<'ctx, T> {
+    Disjoints(
+      self.0.into_iter()
+      .map(
+        |Constrained { content, constraint }| {
+          (content & constraint).0
+        }
+      )
+      .flatten()
+      .collect()
+    )
+  }
+}
+
 impl<'ctx, T: Clone> Disjoints<'ctx, T> {
   pub fn map<U, F>(self, f: F) -> Disjoints<'ctx, U>
     where F: Fn(T) -> U + Clone
@@ -260,7 +275,7 @@ impl<'ctx, T: Clone> Disjoints<'ctx, T> {
   }
 }
 
-impl<'ctx, T: Clone> BitAnd<Bool<'ctx>> for Disjoints<'ctx, T> {
+impl<'ctx, T> BitAnd<Bool<'ctx>> for Disjoints<'ctx, T> {
   type Output = Self;
 
   fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
@@ -268,7 +283,7 @@ impl<'ctx, T: Clone> BitAnd<Bool<'ctx>> for Disjoints<'ctx, T> {
   }
 }
 
-impl<'ctx, T: Clone> BitAnd<&Bool<'ctx>> for Disjoints<'ctx, T> {
+impl<'ctx, T> BitAnd<&Bool<'ctx>> for Disjoints<'ctx, T> {
   type Output = Self;
 
   fn bitand(self, rhs: &Bool<'ctx>) -> Self::Output {
