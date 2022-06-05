@@ -13,7 +13,7 @@ use move_stackless_bytecode::{
     function_target::{FunctionData, FunctionTarget},
     stackless_bytecode::{Bytecode, Label},
 };
-use std::{fmt, cell::{RefCell}};
+use std::{fmt, cell::{RefCell}, ops::BitAndAssign};
 use std::hash::{Hash, Hasher};
 use std::ops::{BitAnd, BitOr};
 use std::{
@@ -89,6 +89,18 @@ impl<'ctx> BitAnd<Bool<'ctx>> for Local<'ctx> {
     }
 }
 
+impl<'ctx> BitAndAssign<Bool<'ctx>> for Local<'ctx> {
+    fn bitand_assign(&mut self, rhs: Bool<'ctx>) {
+        self.content &= rhs;
+    }
+}
+
+impl<'ctx> BitAndAssign<&Bool<'ctx>> for Local<'ctx> {
+    fn bitand_assign(&mut self, rhs: &Bool<'ctx>) {
+        self.content &= rhs;
+    }
+}
+
 impl<'ctx> BitOr<Local<'ctx>> for Local<'ctx> {
     type Output = Self;
 
@@ -132,9 +144,7 @@ impl<'ctx> Local<'ctx> {
 
     /// Set the content to empty, and return the original value.
     pub fn del(&mut self) -> Disjoints<'ctx, Value<'ctx>> {
-        let res = self.content.clone();
-        self.content = Disjoints(Vec::new());
-        res
+        std::mem::replace(&mut self.content, Disjoints(Vec::new()))
     }
 
     /// Return the number of possible values of the local.
@@ -214,6 +224,19 @@ impl<'ctx> BitAnd<Constraint<'ctx>> for LocalState<'ctx> {
                 ts: TerminationStatus::Unsat,
                 ..self
             }
+        }
+    }
+}
+
+impl<'ctx> BitAndAssign<Constraint<'ctx>> for LocalState<'ctx> {
+    fn bitand_assign(&mut self, rhs: Constraint<'ctx>) {
+        let new_pc: Constraint<'ctx> = (&self.pc & &rhs).simplify();
+        if !sat(&new_pc) {
+            self.ts = TerminationStatus::Unsat;
+        }
+        self.pc = new_pc;
+        for local in &mut self.locals {
+            *local &= &rhs;
         }
     }
 }
@@ -538,6 +561,17 @@ impl<'ctx> BitAnd<Bool<'ctx>> for GlobalState<'ctx> {
                     resource_existence: resource_existence.into_iter().map(|(k, v)| (k, v & &rhs)).collect(),
                 }
             }
+        }
+    }
+}
+
+impl<'ctx> BitAndAssign<Constraint<'ctx>> for GlobalState<'ctx> {
+    fn bitand_assign(&mut self, rhs: Constraint<'ctx>) {
+        for (_, v) in self.resource_value.iter_mut() {
+            *v &= &rhs;
+        }
+        for (_, v) in self.resource_existence.iter_mut() {
+            *v &= &rhs;
         }
     }
 }

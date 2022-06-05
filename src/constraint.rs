@@ -1,4 +1,4 @@
-use std::{ops::{BitAnd}, fmt::{Display, self}, iter::FromIterator};
+use std::{ops::{BitAnd, BitAndAssign}, fmt::{Display, self}, iter::FromIterator};
 
 use itertools::iproduct;
 use z3::{ast::{Bool, Ast}, Solver, SatResult, Context};
@@ -179,6 +179,18 @@ impl<'ctx, T: Clone> BitAnd<&Bool<'ctx>> for &Constrained<'ctx, T> {
   }
 }
 
+impl<'ctx, T> BitAndAssign<Bool<'ctx>> for Constrained<'ctx, T> {
+  fn bitand_assign(&mut self, rhs: Bool<'ctx>) {
+   self.constraint &= rhs;   
+  }
+}
+
+impl<'ctx, T> BitAndAssign<&Bool<'ctx>> for Constrained<'ctx, T> {
+  fn bitand_assign(&mut self, rhs: &Bool<'ctx>) {
+   self.constraint &= rhs;   
+  }
+}
+
 impl<'ctx, T: Display> Display for Constrained<'ctx, T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "({} ↩ {})", self.content, self.constraint)
@@ -288,6 +300,22 @@ impl<'ctx, T> BitAnd<&Bool<'ctx>> for Disjoints<'ctx, T> {
 
   fn bitand(self, rhs: &Bool<'ctx>) -> Self::Output {
     self.into_iter().map(|x| x & rhs).collect()
+  }
+}
+
+impl<'ctx, T> BitAndAssign<Bool<'ctx>> for Disjoints<'ctx, T> {
+  fn bitand_assign(&mut self, rhs: Bool<'ctx>) {
+      for x in &mut self.0 {
+        *x &= &rhs;
+      }
+  }
+}
+
+impl<'ctx, T> BitAndAssign<&Bool<'ctx>> for Disjoints<'ctx, T> {
+  fn bitand_assign(&mut self, rhs: &Bool<'ctx>) {
+      for x in &mut self.0 {
+        *x &= rhs;
+      }
   }
 }
 

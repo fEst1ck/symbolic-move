@@ -4,6 +4,7 @@ pub mod dynamic;
 pub mod evaluation;
 pub mod constraint;
 pub mod ty;
+pub mod ast;
 
 use std::{io::Write, collections::BTreeMap};
 

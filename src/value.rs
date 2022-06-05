@@ -391,6 +391,7 @@ impl<'ctx> Not for &PrimitiveValue<'ctx> {
   }
 }
 
+// Root of a memory location
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Root<'ctx> {
   Global(ResourceId, BV<'ctx>),
