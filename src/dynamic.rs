@@ -15,7 +15,7 @@ use z3::{
     Context, FuncDecl,
 };
 
-use crate::{
+use crate::{locals, 
     constraint::{Constrained, Constraint, Disjoints},
     state::{
         BranchCondition, CodeOffset, GlobalState, Local, LocalState, MoveState, TempIndex,
@@ -765,6 +765,63 @@ mod local {
             ),
             // CastU256,
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::empty_locals;
+
+        use super::*;
+        use z3::{Context, Config};
+
+        #[test]
+        fn test_assign_move() {
+            let cfg = Config::new();
+            let ctx = Context::new(&cfg);
+            let mut local_state = locals!(&ctx,
+                U8(0), U8(42)
+            );
+            assign(0, 1, &AssignKind::Move, &mut local_state);
+            assert!(local_state.len() == 2);
+            assert!(local_state[1].is_empty());
+            assert!(local_state[0] == Local::from_constant(&Constant::U8(42), &ctx));
+        }
+
+        #[test]
+        fn test_assign_copy() {
+            let cfg = Config::new();
+            let ctx = Context::new(&cfg);
+            let mut local_state = locals!(&ctx,
+                U8(0), U8(42)
+            );
+            assign(0, 1, &AssignKind::Copy, &mut local_state);
+            assert!(local_state[1] == Local::from_constant(&Constant::U8(42), &ctx));
+            assert!(local_state[0] == Local::from_constant(&Constant::U8(42), &ctx));
+        }
+
+        #[test]
+        fn test_assign_store() {
+            let cfg = Config::new();
+            let ctx = Context::new(&cfg);
+            let mut local_state = locals!(&ctx,
+                U8(0), U8(42)
+            );
+            assign(0, 1, &AssignKind::Copy, &mut local_state);
+            assert!(local_state[1] == Local::from_constant(&Constant::U8(42), &ctx));
+            assert!(local_state[0] == Local::from_constant(&Constant::U8(42), &ctx));
+        }
+
+        #[test]
+        fn test_load() {
+            let cfg = Config::new();
+            let ctx = Context::new(&cfg);
+            let mut local_state = empty_locals!(&ctx, Primitive(U8));
+            assert!(local_state.len() == 1);
+            assert!(local_state[0].is_empty());
+            load(0, &Constant::U8(42), &mut local_state);
+            assert!(local_state.len() == 1);
+            assert!(local_state[0] == Local::from_constant(&Constant::U8(42), &ctx));
         }
     }
 }

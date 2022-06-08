@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use itertools::Itertools;
 use move_model::model::{GlobalEnv, QualifiedInstId, StructId, ModuleId, StructEnv, FieldEnv};
+use move_stackless_bytecode::stackless_bytecode::Constant;
 use z3::{Context, DatatypeSort, DatatypeBuilder, DatatypeAccessor, Sort, FuncDecl};
 
 pub use move_model::ty::{PrimitiveType, Type};
@@ -186,4 +187,17 @@ pub fn get_field_types(global_env: &GlobalEnv, mod_id: ModuleId, struct_id: Stru
       field_env.get_type()
     })
     .collect()
+}
+
+pub fn type_of_constant(c: &Constant) -> Type {
+  use Constant::*;
+  match c {
+    Bool(_) => Type::Primitive(PrimitiveType::Bool),
+    U8(_) => Type::Primitive(PrimitiveType::U8),
+    U64(_) => Type::Primitive(PrimitiveType::U64),
+    U128(_) => Type::Primitive(PrimitiveType::U128),
+    U256(_) => todo!(),
+    Address(_) => Type::Primitive(PrimitiveType::Address),
+    ByteArray(vect) => todo!(),
+  }
 }

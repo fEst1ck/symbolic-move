@@ -3,15 +3,14 @@ use crate::{value::{
     ConstrainedValue,
     PrimitiveValue, Value,
 }, constraint::{Constrained, Constraint, sat, Disjoints},
-    ty::{Type, Datatypes, ResourceId},
-};
+    ty::{PrimitiveType, Type, Datatypes, ResourceId, type_of_constant}, };
 use itertools::Itertools;
 use move_model::model::{
     FunctionEnv, GlobalEnv,
 };
 use move_stackless_bytecode::{
     function_target::{FunctionData, FunctionTarget},
-    stackless_bytecode::{Bytecode, Label},
+    stackless_bytecode::{Bytecode, Label, Constant},
 };
 use std::{fmt, cell::{RefCell}, ops::BitAndAssign};
 use std::hash::{Hash, Hasher};
@@ -68,7 +67,7 @@ impl<'ctx> TerminationStatus<'ctx> {
 }
 
 /// Local variable
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Local<'ctx> {
     pub ty: Type,
     pub(crate) content: Disjoints<'ctx, Value<'ctx>>,
@@ -131,6 +130,10 @@ impl<'ctx> Local<'ctx> {
         }
     }
 
+    pub fn from_constant(c: &Constant, ctx: &'ctx Context) -> Self {
+        Self { ty: type_of_constant(c), content: Disjoints::from_constrained(Constrained::pure(Value::from_constant(c, ctx), ctx)) }
+    }
+
     pub fn to_branch_condition(&self, ctx: &'ctx Context) -> Option<BranchCondition<'ctx>> {
         let mut acc = BranchCondition::or_id(ctx);
         for cv in self.content.clone() {
@@ -176,6 +179,10 @@ impl<'ctx> Local<'ctx> {
             self.content.0.append(&mut other.content.0);
             self
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.content.0.is_empty()
     }
 }
 
@@ -334,6 +341,32 @@ impl<'ctx> LocalState<'ctx> {
     pub fn del(&mut self, var: TempIndex) -> Disjoints<'ctx, Value<'ctx>> {
         self.index_mut(var).del()
     }
+
+    /// Number of locals.
+    pub fn len(&self) -> usize {
+        self.locals.len()
+    }
+}
+
+#[macro_export]
+macro_rules! locals {
+    ( $ctx:expr, $( $x:expr ),* ) => {
+        {
+            use Constant::*;
+            LocalState::new_default($ctx, vec![$(Local::from_constant(&$x, $ctx)),*])
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! empty_locals {
+    ( $ctx:expr, $( $ty:expr ),* ) => {
+        {
+            use crate::ty::PrimitiveType::*;
+            use Type::*;
+            LocalState::new_default($ctx, vec![$(Local::new($ty)),*])
+        }
+    };
 }
 
 pub type ConstrainedArray<'ctx> = Constrained<'ctx, Array<'ctx>>;

@@ -191,6 +191,13 @@ impl<'ctx, T> BitAndAssign<&Bool<'ctx>> for Constrained<'ctx, T> {
   }
 }
 
+impl<'ctx, T: PartialEq> PartialEq for Constrained<'ctx, T>
+{
+    fn eq(&self, other: &Self) -> bool {
+      self.content == other.content && self.constraint == other.constraint
+    }
+}
+
 impl<'ctx, T: Display> Display for Constrained<'ctx, T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "({} ↩ {})", self.content, self.constraint)
@@ -268,6 +275,10 @@ impl<'ctx, T> Disjoints<'ctx, Disjoints<'ctx, T>> {
 }
 
 impl<'ctx, T: Clone> Disjoints<'ctx, T> {
+  pub fn from_constrained(x: Constrained<'ctx, T>) -> Self {
+    Self(vec![x])
+  }
+
   pub fn map<U, F>(self, f: F) -> Disjoints<'ctx, U>
     where F: Fn(T) -> U + Clone
   {
@@ -338,4 +349,11 @@ impl<'ctx, T: Clone> Clone for Disjoints<'ctx, T> {
   fn clone(&self) -> Self {
     Disjoints(self.0.clone())
   }
+}
+
+impl<'ctx, T: PartialEq> PartialEq for Disjoints<'ctx, T>
+{
+    fn eq(&self, other: &Self) -> bool {
+      self.0 == other.0
+    }
 }

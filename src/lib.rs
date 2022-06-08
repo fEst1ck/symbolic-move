@@ -5,6 +5,7 @@ pub mod evaluation;
 pub mod constraint;
 pub mod ty;
 pub mod ast;
+pub mod se;
 
 use std::{io::Write, collections::BTreeMap};
 
