@@ -8,6 +8,7 @@ pub use move_model::ty::{PrimitiveType, Type};
 
 use crate::value::PrimitiveValue;
 
+/// Convert move primitive type to Z3 sort.
 pub fn primitive_type_to_sort<'ctx>(t: &PrimitiveType, ctx: &'ctx Context) -> Sort<'ctx> {
   match t {
     PrimitiveType::Bool => Sort::bool(ctx),
@@ -48,56 +49,40 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
     self.ctx
   }
 
-  // Get the uninitiated struct type.
-  pub fn get_struct_type(&self, mod_id: ModuleId, struct_id: StructId) -> Type {
-    let struct_env = self.global_env.get_struct(mod_id.qualified(struct_id));
-    let field_types: Vec<Type> = struct_env
-        .get_fields()
-        .map(|field_env| field_env.get_type())
-        .collect();
-    Type::Struct(mod_id, struct_id, field_types)
-  }
-
-  pub fn get_resource_type(&self, resource_id: ResourceId) -> Type {
-    self.get_struct_type(resource_id.module_id, resource_id.id).instantiate(&resource_id.inst)
-  }
-
-  // Get the uninitiated struct type.
+  /// Get the types of the struct fields.
   pub fn get_field_types(&self, mod_id: ModuleId, struct_id: StructId) -> Vec<Type> {
     get_field_types(self.global_env, mod_id, struct_id)
   }
 
-  pub fn insert(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) {
-    if !self.table.contains_key(&Type::Struct(module_id.clone(), struct_id.clone(), type_params.clone())) {
-      let field_types = Type::instantiate_vec(self.get_field_types(module_id.clone(), struct_id.clone()), &type_params);
-      let module_env = self.global_env.get_module(module_id);
-      let struct_env: StructEnv = module_env.get_struct(struct_id);
-      let struct_name = &struct_env.get_full_name_str();
-      let field_names: Vec<String> = struct_env.get_fields().map(|field_env| get_field_name(&struct_env, &field_env)).collect();
-      let qualified_field_names: Vec<String> = field_names.into_iter().map(|field_name| format!("{}-{}", struct_name, field_name)).collect();
-      let data_type = DatatypeBuilder::new(self.get_ctx(), format!("{}<{:?}>", struct_env.get_full_name_str(), type_params.iter().format(", ")))
-        .variant(
-          struct_name,
-          qualified_field_names.iter().map(|qualified_field_name| &qualified_field_name[..])
-          .zip(
-            field_types.iter().map(|t| DatatypeAccessor::Sort(self.type_to_sort(t)))
-          ).collect()
-        )
-        .finish();
-      self.table.insert(Type::Struct(module_id, struct_id, type_params), data_type);
-    }
+  /// Memorize the given struct.
+  pub fn insert(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) -> &DatatypeSort<'ctx> {
+    let field_types = self.get_field_types(module_id.clone(), struct_id.clone());
+    let field_sorts: Vec<_> = field_types.iter().map(|t| DatatypeAccessor::Sort(self.type_to_sort(t))).collect();
+    let ctx = self.get_ctx();
+    self.table
+        .entry(Type::Struct(module_id.clone(), struct_id.clone(), type_params.clone()))
+        .or_insert({
+          let module_env = self.global_env.get_module(module_id);
+          let struct_env: StructEnv = module_env.get_struct(struct_id);
+          let struct_name = &struct_env.get_full_name_str();
+          let field_names: Vec<String> = struct_env.get_fields().map(|field_env| get_field_name(&struct_env, &field_env)).collect();
+          let qualified_field_names: Vec<String> = field_names.into_iter().map(|field_name| format!("{}-{}", struct_name, field_name)).collect();
+          let data_type = DatatypeBuilder::new(ctx, format!("{}<{:?}>", struct_env.get_full_name_str(), type_params.iter().format(", ")))
+            .variant(
+              struct_name,
+              qualified_field_names.iter().map(|qualified_field_name| &qualified_field_name[..])
+              .zip(
+                field_sorts
+              ).collect()
+            )
+            .finish();
+          data_type
+        })
   }
 
-  /// Turn a resource id to a Z3 datatype, memoized.
+  // Turn a resource id to a Z3 datatype, memoized.
   fn from_struct1(&mut self, module_id: ModuleId, struct_id: StructId, type_params: Vec<Type>) -> &DatatypeSort<'ctx> {
-    let struct_type = Type::Struct(module_id.clone(), struct_id.clone(), type_params.clone());
-    // cannot directly match self.table.get here, 
-    if self.table.contains_key(&struct_type) {
-      self.table.get(&struct_type).unwrap()
-    } else {
-      self.insert(module_id, struct_id, type_params.clone());
-      self.from_struct1(module_id, struct_id, type_params)
-    }
+    self.insert(module_id, struct_id, type_params)
   }
 
   /// Turn a resource id to a Z3 datatype, memoized.
@@ -117,7 +102,7 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
   // should only be called when `t` is cached!
   pub fn pack(&self, t: &Type) -> Option<&FuncDecl<'ctx>> {
     match t {
-      Type::Struct(_, _, _) => {
+      Type::Struct(mod_id, struct_id, type_params) => {
         // if !self.table.contains_key(t) {
         //   self.insert(*mod_id, *struct_id, type_params.clone());
         // }
@@ -140,16 +125,15 @@ impl<'ctx, 'env> Datatypes<'ctx, 'env> {
     }
   }
 
-  // should only be called when `t` is cached!
+  /// Return the constructor, and field selectors of a struct.
   pub fn pack_unpack(&mut self, t: &Type) -> Option<(&FuncDecl<'ctx>, &Vec<FuncDecl<'ctx>>)> {
     match t {
       Type::Struct(mod_id, struct_id, type_params) => {
         if !self.table.contains_key(t) {
           self.insert(*mod_id, *struct_id, type_params.clone());
         }
-        self.table.get(t).map(|x| 
-        (&x.variants[0].constructor, &x.variants[0].accessors)
-      )
+        let datatype_sort = self.insert(*mod_id, *struct_id, type_params.clone());
+        Some((&datatype_sort.variants[0].constructor, &datatype_sort.variants[0].accessors))
     }
       _ => None,
     }
