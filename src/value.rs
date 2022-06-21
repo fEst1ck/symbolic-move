@@ -2,7 +2,7 @@
 
 use move_core_types::account_address::AccountAddress;
 use move_model::ast::TempIndex;
-use crate::{ty::{PrimitiveType, Type, Datatypes, new_resource_id, ResourceId}, state::BranchCondition};
+use crate::{ty::{PrimitiveType, Type, Datatypes, new_resource_id, ResourceId}, dynamic::BranchCondition};
 use move_stackless_bytecode::stackless_bytecode::{Constant};
 use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem, Sub}, fmt::{Display, self}, rc::Rc, cell::RefCell};
 use z3::{
