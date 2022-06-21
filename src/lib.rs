@@ -4,6 +4,7 @@ pub mod dynamic;
 pub mod constraint;
 pub mod ty;
 pub mod bytecode;
+pub mod traits;
 
 use move_model::{model::{GlobalEnv, ModuleEnv, FunId, FunctionEnv}, ast::ModuleName};
 
