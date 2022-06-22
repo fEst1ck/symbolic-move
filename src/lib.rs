@@ -7,6 +7,7 @@ pub mod ty;
 pub mod bytecode;
 pub mod traits;
 pub mod context;
+pub mod symbolic_tree;
 
 use move_model::{model::{GlobalEnv, ModuleEnv, FunId, FunctionEnv}, ast::ModuleName};
 
