@@ -6,9 +6,9 @@ pub enum TerminationStatus<'ctx> {
     /// Still running
     None,
     /// Returned
-    Return(Vec<Disjoints<'ctx, Value<'ctx>>>),
+    Return(Vec<Values<'ctx>>),
     /// Aborted
-    Abort(Disjoints<'ctx, Value<'ctx>>),
+    Abort(Values<'ctx>),
     /// Unfeasible execution path
     Unsat,
 }
@@ -31,12 +31,14 @@ impl<'ctx> fmt::Display for TerminationStatus<'ctx> {
                 writeln!(f, "Returns with values:")?;
                 for (i, val) in return_vals.iter().enumerate() {
                     write!(f, "#{}: ", i)?;
-                    writeln!(f, "{}", val.iter().format(", "))?;
+                    // writeln!(f, "{}", val.iter().format(", "))?;
+                    todo!()
                 }
                 Ok(())
             }
             TerminationStatus::Abort(val) => {
-                writeln!(f, "Aborts with error code {}.", val.iter().format(", "))
+                // writeln!(f, "Aborts with error code {}.", val.iter().format(", "))
+                todo!()
             }
             TerminationStatus::Unsat => writeln!(f, "Unsatisfied"),
         }

@@ -2,9 +2,8 @@
 use crate::{value::{
     ConstrainedValue,
     PrimitiveValue, Value,
-}, constraint::{Constrained, Constraint, Disjoints},
-    ty::{Type, Datatypes, ResourceId, type_of_constant}, };
-use itertools::Itertools;
+}, constraint::{Constrained, Constraint, OrderedConstraint},
+    ty::{Type, Datatypes, ResourceId, type_of_constant}, symbolic_tree::SymbolicTree, };
 use move_stackless_bytecode::{
     stackless_bytecode::{Constant},
 };
@@ -22,6 +21,7 @@ use z3::{
 pub type CodeOffset = u16;
 pub type TempIndex = usize;
 pub type BlockId = CodeOffset;
+pub type Values<'ctx> = SymbolicTree<OrderedConstraint<'ctx>, Value<'ctx>>;
 
 pub mod termination;
 pub mod local;

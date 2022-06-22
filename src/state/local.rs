@@ -1,16 +1,16 @@
-use crate::dynamic::BranchCondition;
+use crate::{dynamic::BranchCondition, traits::Applicative};
 
 use super::*;
 
 // # Local Variables ////////////////////////////////////////
 
 /// Information about a local variable
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Local<'ctx> {
     /// Type of the local
     pub ty: Type,
     /// Values of the local
-    pub(crate) content: Disjoints<'ctx, Value<'ctx>>,
+    pub(crate) content: Option<Values<'ctx>>,
 }
 
 impl<'ctx> Local<'ctx> {
@@ -18,29 +18,32 @@ impl<'ctx> Local<'ctx> {
     pub fn new(ty: Type) -> Self {
         Self {
             ty,
-            content: Disjoints(Vec::new()),
+            content: None,
         }
     }
 
     /// Simplify each value.
     pub fn simplify(self) -> Self {
         Self {
-            content: self.content.into_iter().map(|x| x.simplify()).collect(),
+            content: todo!(),
             ..self
         }
     }
 
-    /// New local with name `x`, type `t`. Contains a fresh symbolic value.
+    /// New local with name `x`, type `t`. Contains a new named symbolic value.
     pub fn from_type<'env, S: Into<Symbol>>(x: S, t: &Type, ctx: &'ctx Context, datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>) -> Self {
         Self {
             ty: t.clone(),
-            content: Disjoints(vec![ConstrainedValue::new_const(x, t, ctx, datatypes)]),
+            content: Some(Values::pure(Value::new_const(x, t, ctx, datatypes))), // pure uses global ctx!!
         }
     }
 
     /// New local with a constant value.
     pub fn from_constant(c: &Constant, ctx: &'ctx Context) -> Self {
-        Self { ty: type_of_constant(c), content: Disjoints::from_constrained(Constrained::pure(Value::from_constant(c, ctx), ctx)) }
+        Self {
+            ty: type_of_constant(c),
+            content: Some(Values::pure(Value::from_constant(c, ctx))), // pure uses global ctx!!
+        }
     }
 
     /// Return the branch condition corresponding to the local (None if local is not a boolean).
@@ -48,95 +51,37 @@ impl<'ctx> Local<'ctx> {
     /// then the true branch is (or (and x p) ...),
     /// and the false branch is (or (and (not x) p) ...).
     pub fn to_branch_condition(&self, ctx: &'ctx Context) -> Option<BranchCondition<'ctx>> {
-        let mut acc = BranchCondition::or_id(ctx);
-        for cv in self.content.clone() {
-            match cv.to_branch_condition() {
-                Some(bc) => acc = (acc | bc).simplify(),
-                None => return None
-            }
-        }
-        Some(acc)
+        todo!()
     }
 
     /// Set the content to empty, and return the original value.
-    pub fn del(&mut self) -> Disjoints<'ctx, Value<'ctx>> {
-        std::mem::replace(&mut self.content, Disjoints(Vec::new()))
+    pub fn del(&mut self) -> Option<Values<'ctx>> {
+        std::mem::replace(&mut self.content, None)
     }
 
     /// Return the number of possible values of the local.
     pub fn len(&self) -> usize {
-        self.content.0.len()
+        todo!()
     }
 
     /// Return the merge of the locals.
-    pub fn merge(mut self, mut other: Self) -> Self {
-        fn merge_content<'ctx>(
-            xs: Vec<ConstrainedValue<'ctx>>,
-            ys: Vec<ConstrainedValue<'ctx>>,
-        ) -> Vec<ConstrainedValue<'ctx>> {
-            let mut res = Vec::with_capacity(xs.len());
-            for (x, y) in xs.into_iter().zip(ys.into_iter()) {
-                res.append(&mut x.merge(y));
-            }
-            res
-        }
-        if self.len() == other.len() {
-            Self {
-                ty: {
-                    assert!(self.ty == other.ty);
-                    self.ty
-                },
-                content: Disjoints(merge_content(self.content.0, other.content.0)),
-            }
-        } else {
-            self.content.0.append(&mut other.content.0);
-            self
-        }
+    pub fn merge(&mut self, other: Self, cond: OrderedConstraint<'ctx>) {
+        todo!()
     }
 
     /// Return true iff the local has no value associated.
     /// For example, when a local is uninitiated or moved.
     pub fn is_empty(&self) -> bool {
-        self.content.0.is_empty()
+        self.content.is_none()
     }
 }
 
 // trait implementations
 impl<'ctx, 'env> fmt::Display for Local<'ctx> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.content.iter().format(", "))?;
-        Ok(())
-    }
-}
-
-/// Add constraint to a local.
-impl<'ctx> BitAnd<Bool<'ctx>> for Local<'ctx> {
-    type Output = Self;
-
-    /// (x, p) ... & q -> (x, p & q) ...
-    fn bitand(self, rhs: Bool<'ctx>) -> Self::Output {
-        Local { content: self.content & rhs, ..self }
-    }
-}
-
-impl<'ctx> BitAndAssign<Bool<'ctx>> for Local<'ctx> {
-    fn bitand_assign(&mut self, rhs: Bool<'ctx>) {
-        self.content &= rhs;
-    }
-}
-
-impl<'ctx> BitAndAssign<&Bool<'ctx>> for Local<'ctx> {
-    fn bitand_assign(&mut self, rhs: &Bool<'ctx>) {
-        self.content &= rhs;
-    }
-}
-
-/// Merge locals
-impl<'ctx> BitOr<Local<'ctx>> for Local<'ctx> {
-    type Output = Self;
-
-    fn bitor(self, rhs: Local<'ctx>) -> Self {
-        self.merge(rhs)
+        // write!(f, "{}", self.content.iter().format(", "))?;
+        // Ok(())
+        todo!()
     }
 }
 
@@ -162,17 +107,10 @@ impl<'ctx> LocalMemory<'ctx> {
         }
     }
 
-    pub fn merge(self, other: Self) -> Self {
-        Self {
-            locals: {
-                self
-                    .locals
-                    .into_iter()
-                    .zip(other.locals.into_iter())
-                    .map(|(x, y)| (x | y).simplify())
-                    .collect()
-            },
-            ..self
+    /// Merge the locals in `mask`.
+    pub fn merge(&mut self, other: Self, cond: OrderedConstraint<'ctx>, mask: impl Iterator<Item=TempIndex>) {
+        for local_index in mask {
+            self[local_index].merge(other[local_index], cond.clone())
         }
     }
 
@@ -181,14 +119,8 @@ impl<'ctx> LocalMemory<'ctx> {
     /// where t_i = ... (x_i_j, p_i_j) ...
     /// then the return value should be equivalent to
     /// ... ((... x_i_j ...), (and ... p_i_j ...)) ...
-    pub fn args(&self, srcs: &[TempIndex]) -> Disjoints<'ctx, Vec<Value<'ctx>>> {
-        srcs
-            .iter()
-            .map(|idx| self.index(*idx).content.clone().map(|x| vec![x]))
-            .fold(
-                Disjoints::unit(self.get_ctx()),
-                |acc, x| acc.mappend(x)
-            )
+    pub fn args(&self, srcs: &[TempIndex]) -> SymbolicTree<OrderedConstraint<'ctx>, Vec<Value<'ctx>>> {
+        todo!()
     }
 
     pub fn get_ctx(&self) -> &'ctx Context {
@@ -196,7 +128,7 @@ impl<'ctx> LocalMemory<'ctx> {
     }
 
     /// Set `var` to empty and return the original values of `var`.
-    pub fn del(&mut self, var: TempIndex) -> Disjoints<'ctx, Value<'ctx>> {
+    pub fn del(&mut self, var: TempIndex) -> Option<Values<'ctx>> {
         self.index_mut(var).del()
     }
 
@@ -221,26 +153,6 @@ impl<'ctx> Index<TempIndex> for LocalMemory<'ctx> {
 impl<'ctx> IndexMut<TempIndex> for LocalMemory<'ctx> {
     fn index_mut(&mut self, index: TempIndex) -> &mut Self::Output {
         self.locals.index_mut(index)
-    }
-}
-
-/// Add constraint to each local
-impl<'ctx> BitAnd<Constraint<'ctx>> for LocalMemory<'ctx> {
-    type Output = Self;
-
-    fn bitand(self, rhs: Constraint<'ctx>) -> Self::Output {
-        LocalMemory {
-            locals: self.locals.into_iter().map(|x| (x & rhs.clone()).simplify()).collect(),
-            ..self
-        }
-    }
-}
-
-impl<'ctx> BitAndAssign<Constraint<'ctx>> for LocalMemory<'ctx> {
-    fn bitand_assign(&mut self, rhs: Constraint<'ctx>) {
-        for local in &mut self.locals {
-            *local &= &rhs;
-        }
     }
 }
 

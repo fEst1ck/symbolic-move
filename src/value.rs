@@ -2,7 +2,7 @@
 
 use move_core_types::account_address::AccountAddress;
 use move_model::ast::TempIndex;
-use crate::{ty::{PrimitiveType, Type, Datatypes, new_resource_id, ResourceId}, dynamic::BranchCondition};
+use crate::{ty::{PrimitiveType, Type, Datatypes, new_resource_id, ResourceId}, dynamic::BranchCondition, traits::Applicative};
 use move_stackless_bytecode::stackless_bytecode::{Constant};
 use std::{ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem, Sub}, fmt::{Display, self}, rc::Rc, cell::RefCell};
 use z3::{
@@ -791,7 +791,7 @@ pub type ConstrainedValue<'ctx> = Constrained<'ctx, Value<'ctx>>;
 impl<'ctx> ConstrainedValue<'ctx> {
   /// Construct a new symbolic constant with the given name and type.
   pub fn new_const<'env, S: Into<Symbol>>(x: S, t: &Type, context: &'ctx Context, datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>) -> Self {
-    Constrained::pure(Value::new_const(x, t, context, datatypes), context)
+    Constrained::pure(Value::new_const(x, t, context, datatypes))
   }
 
   /// Convert a constrained boolean to a branch condition.
