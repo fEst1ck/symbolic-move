@@ -1,49 +1,55 @@
-#![feature(generic_associated_types)]
-
-trait Functor {
+pub trait Functor {
     /// The `a` in `F a`
-    type A;
+    type Source;
 
     /// The `F b` in `F a -> F b`
     type Fb<B>: Functor<Source=B>;
 
     fn map<B, F>(self, f: F) -> Self::Fb<B>
-        where F: Fn(Self::A) -> B;
+        where F: Fn(Self::Source) -> B;
 }
 
-trait Monoidal: Functor {
+pub trait Monoidal: Functor + Sized {
     fn unit() -> Self::Fb<()>;
 
-    fn prod<B>(self, other: Fb<B>) -> Self::Fb<(Self::A, B)>;
-}
+    fn prod<B: Clone>(self, other: Self::Fb<B>) -> Self::Fb<(Self::Source, B)>;
 
-impl<T: Applicative> Monoidal for T {
-    fn unit() -> Self::Fb<()> {
-        pure(())
-    }
-
-    fn prod<B>(self, other: Fb<B>) -> Self::Fb<(Self::A, B)> {
-        self.map(|x: Self::A| (|y: B| (x, y)))
-            .ap(other)
-    }
-}
-
-trait Applicative: Functor {
-    fn pure(x: Self::A) -> Self;
-
-    fn ap<B>(f: Self::Fb(F)) -> Fb(B)
-        where F: Fn(Self::A) -> B;
-}
-
-impl<T: Monoidal> Applicative for T {
-    fn pure(x: Self::A) -> Self {
-        unit().map(|_| x)
-    }
-
-    fn ap<B>(f: Self::Fb(F)) -> Fb(B)
-        where F: Fn(Self::A) -> B
+    fn lift_a2<F, B: Clone, C>(self, another: Self::Fb<B>, f: F)
+    -> <<Self as Functor>::Fb<(<Self as Functor>::Source, B)> as Functor>::Fb<C>
+        where F: Fn(Self::Source, B) -> C
     {
-        f.prod(self)
-         .map(|(f, a)| f(a))    
+        self.prod(another)
+        .map(|(x, y)| f(x, y))
     }
 }
+
+// impl<T: Applicative> Monoidal for T {
+//     fn unit() -> Self::Fb<()> {
+//         Self::pure(())
+//     }
+
+//     fn prod<B>(self, other: Self::Fb<B>) -> Self::Fb<(Self::Source, B)> {
+//         self.map(|x: Self::Source| (|y: B| (x, y)))
+//             .ap(other)
+//     }
+// }
+
+pub trait Applicative: Functor {
+    fn pure(x: Self::Source) -> Self;
+
+    fn ap<B, F>(self, f: Self::Fb<F>) -> Self::Fb<B>
+        where F: Fn(Self::Source) -> B + Clone;
+}
+
+// impl<T: Monoidal> Applicative for T {
+//     fn pure(x: Self::Source) -> Self {
+//         Self::unit().map(|_: ()| x)
+//     }
+
+//     fn ap<B, F>(self, f: Self::Fb<F>) -> Self::Fb<B>
+//         where F: Fn(Self::Source) -> B
+//     {
+//         f.prod(self)
+//          .map(|(f, a)| f(a))    
+//     }
+// }
