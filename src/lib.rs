@@ -1,3 +1,4 @@
+#![feature(generic_associated_types)]
 pub mod state;
 pub mod value;
 pub mod dynamic;
@@ -5,6 +6,7 @@ pub mod constraint;
 pub mod ty;
 pub mod bytecode;
 pub mod traits;
+pub mod context;
 
 use move_model::{model::{GlobalEnv, ModuleEnv, FunId, FunctionEnv}, ast::ModuleName};
 
