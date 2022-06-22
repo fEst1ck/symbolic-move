@@ -13,6 +13,7 @@ use crate::{traits::{Functor, Monoidal, Applicative}, context::global_context};
 /// Boolean sort
 pub type Constraint<'ctx> = Bool<'ctx>;
 
+#[derive(Debug, Clone)]
 pub struct OrderedConstraint<'ctx> {
     time_stamp: usize,
     constraint: Constraint<'ctx>
