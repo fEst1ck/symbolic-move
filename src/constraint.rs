@@ -16,7 +16,7 @@ pub type Constraint<'ctx> = Bool<'ctx>;
 #[derive(Debug, Clone)]
 pub struct OrderedConstraint<'ctx> {
     time_stamp: usize,
-    constraint: Constraint<'ctx>
+    pub constraint: Constraint<'ctx>
 }
 
 impl<'ctx> PartialEq for OrderedConstraint<'ctx> {
@@ -105,7 +105,11 @@ impl<T> Monoidal for Constrained<'static, T> {
 
 impl<T: Clone> Applicative for Constrained<'static, T> {
     fn pure(x: Self::Source) -> Self {
-        Self::unit().map(|_: ()| x)
+        // Self::unit().map(|_: ()| x)
+        Constrained {
+            content: x,
+            constraint: Bool::from_bool(global_context(), true),
+        }
     }
 
     fn ap<B, F>(self, f: Self::Fb<F>) -> Constrained<'static, B>
