@@ -6,7 +6,7 @@ pub trait Functor {
     type Fb<B>: Functor<Source=B>;
 
     fn map<B, F>(self, f: F) -> Self::Fb<B>
-        where F: Fn(Self::Source) -> B;
+        where F: Fn(Self::Source) -> B + Clone;
 }
 
 pub trait Monoidal: Functor + Sized {

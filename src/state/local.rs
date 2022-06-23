@@ -110,7 +110,7 @@ impl<'ctx> LocalMemory<'ctx> {
     /// Merge the locals in `mask`.
     pub fn merge(&mut self, other: Self, cond: OrderedConstraint<'ctx>, mask: impl Iterator<Item=TempIndex>) {
         for local_index in mask {
-            self[local_index].merge(other[local_index], cond.clone())
+            self[local_index].merge(other[local_index].clone(), cond.clone()) // todo! this is unnecessarily inefficient
         }
     }
 
@@ -139,7 +139,7 @@ impl<'ctx> LocalMemory<'ctx> {
 }
 
 // traits for LocalMem
-use std::ops::{Index, IndexMut};
+use std::{ops::{Index, IndexMut}, mem::take};
 
 impl<'ctx> Index<TempIndex> for LocalMemory<'ctx> {
     type Output = Local<'ctx>;

@@ -14,9 +14,11 @@ use z3::{
 };
 
 use crate::{
-    constraint::{Constrained, Constraint, Disjoints},
+    constraint::{Constrained, Constraint, OrderedConstraint},
+    symbolic_tree::{SymbolicTree},
     ty::{new_resource_id, Datatypes, FieldId, Type},
-    value::{ConstrainedValue, Loc, PrimitiveValue, Root, Value}, state::{TempIndex, LocalMemory, GlobalMemory, EvalState, Local},
+    value::{ConstrainedValue, Loc, PrimitiveValue, Root, Value}, state::{TempIndex, LocalMemory, GlobalMemory, EvalState, Local, Values},
+    traits::{Applicative, Functor, Monoidal},
 };
 
 // Evaluate an `Assign`.
@@ -30,10 +32,7 @@ fn assign<'ctx>(dst: TempIndex, src: TempIndex, kind: &AssignKind, loc_mem: &mut
 
 // Evaluate a `Load`.
 fn load<'ctx>(dst: TempIndex, c: &Constant, loc_mem: &mut LocalMemory<'ctx>) {
-    loc_mem[dst].content = Disjoints(vec![ConstrainedValue::new(
-        Value::from_constant(c, loc_mem.get_ctx()),
-        Bool::from_bool(loc_mem.get_ctx(), true),
-    )]);
+    loc_mem[dst].content = Some(Values::pure(Value::from_constant(c, loc_mem.context)));
 }
 
 // Handle pure operations.
@@ -51,18 +50,11 @@ fn pure_local_operation<'ctx, F>(
     for &x in dsts {
         loc_mem.index_mut(x).del();
     }
-    for Constrained {
-        content: vals,
-        constraint,
-    } in dests_val
-    {
-        debug_assert!(vals.len() == dsts.len());
-        for (&dst, val) in dsts.iter().zip(vals.into_iter()) {
-            loc_mem.index_mut(dst)
-                .content
-                .0
-                .push(ConstrainedValue::new(val.simplify(), constraint.clone()))
-        }
+    for (i, &x) in dsts.iter().enumerate() {
+        loc_mem[x].content = Some(dests_val.clone().map(|vals| {
+            debug_assert!(vals.len() == dsts.len());
+            vals[i].clone() // todo! unnecessary clone
+        }));
     }
 }
 
@@ -113,7 +105,7 @@ fn operation<'ctx, 'env>(
         mut glob_mem: GlobalMemory<'ctx>,
         root: Root<'ctx>,
         datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>,
-    ) -> Disjoints<'ctx, Value<'ctx>> {
+    ) -> Values<'ctx> {
         match root {
             Root::Global(resource_id, addr) => {
                 glob_mem.get_resource_value(&resource_id, datatypes)
@@ -121,7 +113,7 @@ fn operation<'ctx, 'env>(
                         Value::Struct(addr_to_resource_val.select(&addr).as_datatype().unwrap())
                     })
             }
-            Root::Local(local_index) => loc_mem[local_index].content.clone(),
+            Root::Local(local_index) => loc_mem[local_index].content.clone().unwrap(),
         }
     }
 
@@ -132,7 +124,7 @@ fn operation<'ctx, 'env>(
         loc: Loc<'ctx>,
         root_type: &Type,
         datatypes: Rc<RefCell<Datatypes<'ctx, 'env>>>,
-    ) -> Disjoints<'ctx, Dynamic<'ctx>> {
+    ) -> SymbolicTree<OrderedConstraint<'ctx>, Dynamic<'ctx>> {
         // accessors = f, g, ...
         // out: (... (g (f v)) ...)
         fn rep_select<'ctx>(v: Dynamic<'ctx>, accessors: &[&FuncDecl<'ctx>]) -> Dynamic<'ctx> {
@@ -247,19 +239,22 @@ fn operation<'ctx, 'env>(
                 inst: type_params.clone(),
                 id: *struct_id,
             };
-            let branch_condition = glob_mem
-                .exists(&resource_type, &addr_val)
-                .to_branch_condition(loc_mem.get_ctx());
-            *loc_mem &= branch_condition.false_branch.clone();
-            *glob_mem &= branch_condition.false_branch;
+            let branch_condition = BranchCondition::from(
+                glob_mem
+                .exists(&resource_type, addr_val.unwrap())
+            );
             glob_mem.real_move_to(
                 &resource_type,
-                &loc_mem[srcs[0]]
+                loc_mem[srcs[0]]
                     .content
+                    .as_ref()
+                    .expect(format!("{} is uninitialized or moved", srcs[0]).as_str())
                     .clone()
                     .map(|x| x.as_addr().unwrap().clone()),
                 loc_mem[srcs[1]]
                     .content
+                    .as_ref()
+                    .expect(format!("{} is uninitialized or moved", srcs[1]).as_str())
                     .clone()
                     .map(|x| x.as_datatype().unwrap().clone()),
                 datatypes,
@@ -269,76 +264,99 @@ fn operation<'ctx, 'env>(
         MoveFrom(module_id, struct_id, type_params) => {
             let addr_val = loc_mem[srcs[0]].content.clone();
             let resource_id = new_resource_id(*module_id, *struct_id, type_params.clone());
-            let branch_condition = glob_mem
-                .exists(&resource_id, &addr_val)
-                .to_branch_condition(loc_mem.get_ctx());
-            *loc_mem &= branch_condition.true_branch.clone();
-            *glob_mem &= branch_condition.true_branch;
+            let branch_condition = BranchCondition::from(
+                glob_mem
+                .exists(&resource_id, addr_val.unwrap())
+            );
             let resource_moved_out = glob_mem.real_move_from(
                 &resource_id,
-                &loc_mem[srcs[0]]
+                loc_mem[srcs[0]]
                     .content
+                    .as_ref()
+                    .expect(format!("{} is uninitialized or moved", srcs[0]).as_str())
                     .clone()
                     .map(|x| x.as_addr().unwrap().clone()),
                 datatypes,
             );
             loc_mem[dsts[0]].content =
-                resource_moved_out.map(|x| Value::Struct(x.as_datatype().unwrap()));
+                Some(resource_moved_out.map(|x| Value::Struct(x.as_datatype().unwrap())));
             Some(branch_condition.false_branch)
         }
         Exists(module_id, struct_id, type_params) => {
             let dst = dsts[0];
             let src = srcs[0];
-            let src_val = loc_mem[src].content.clone();
+            let src_val =
+                loc_mem[src]
+                .content
+                .as_ref()
+                .expect(format!("{} is uninitialized or moved", srcs[0]).as_str())
+                .clone();
             let resource_type = QualifiedInstId {
                 module_id: *module_id,
                 inst: type_params.clone(),
                 id: *struct_id,
             };
-            loc_mem[dst].content = glob_mem
-                .exists(&resource_type, &src_val)
-                .map(|x| Value::Primitive(PrimitiveValue::Bool(x)));
+            loc_mem[dst].content = Some(
+                glob_mem
+                .exists(&resource_type, src_val)
+                .map(|x| Value::Primitive(PrimitiveValue::Bool(x)))
+            );
             None
         }
 
         // Borrow
         // BorrowLoc,
         BorrowLoc => {
-            loc_mem[dsts[0]].content = Disjoints(vec![Constrained::new(
-                Value::Reference(Loc {
-                    root: Root::Local(srcs[0]),
-                    access_path: Vec::new(),
-                }),
-                Bool::from_bool(loc_mem.get_ctx(), true),
-            )]);
+            loc_mem[dsts[0]].content = Some(
+                Values::pure(
+                    Value::Reference(Loc {
+                        root: Root::Local(srcs[0]),
+                        access_path: Vec::new(),
+                    })
+                )
+            );
             None
         }
         // BorrowField(ModuleId, StructId, Vec<Type>, usize),
         BorrowField(_, _, _, field_id) => {
-            loc_mem[dsts[0]].content = loc_mem[srcs[0]].content.clone().map(|x| match x {
-                Value::Reference(Loc { root, access_path }) => {
-                    let mut new_access_path = access_path;
-                    new_access_path.push(*field_id);
-                    Value::Reference(Loc {
-                        root,
-                        access_path: new_access_path,
-                    })
-                }
-                _ => unreachable!(),
-            });
+            loc_mem[dsts[0]].content = Some(
+                loc_mem[srcs[0]]
+                .content
+                .as_ref()
+                .expect(format!("{} is uninitialized or moved", srcs[0]).as_str())
+                .clone()
+                .map(|x| match x {
+                    Value::Reference(Loc { root, access_path }) => {
+                        let mut new_access_path = access_path;
+                        new_access_path.push(*field_id);
+                        Value::Reference(Loc {
+                            root,
+                            access_path: new_access_path,
+                        })
+                    }
+                    _ => unreachable!(),
+                })
+            );
             None
         }
         // BorrowGlobal(ModuleId, StructId, Vec<Type>),
         BorrowGlobal(module_id, struct_id, type_params) => {
-            loc_mem[dsts[0]].content = loc_mem[srcs[0]].content.clone().map(|x| {
-                Value::Reference(Loc {
-                    root: Root::Global(
-                        new_resource_id(*module_id, *struct_id, type_params.clone()),
-                        x.as_addr().unwrap().clone(),
-                    ),
-                    access_path: Vec::new(),
+            loc_mem[dsts[0]].content = Some(
+                loc_mem[srcs[0]]
+                .content
+                .as_ref()
+                .expect(format!("{} is uninitialized or moved", srcs[0]).as_str())
+                .clone()
+                .map(|x| {
+                    Value::Reference(Loc {
+                        root: Root::Global(
+                            new_resource_id(*module_id, *struct_id, type_params.clone()),
+                            x.as_addr().unwrap().clone(),
+                        ),
+                        access_path: Vec::new(),
+                   })
                 })
-            });
+            );
             None
         }
         // Get
@@ -349,30 +367,43 @@ fn operation<'ctx, 'env>(
                 .unwrap();
             let accessor = &accessors[*field_num];
             let dst_type = &loc_mem[dsts[0]].ty;
-            loc_mem[dsts[0]].content = loc_mem[srcs[0]].content.clone().map(|x| {
-                let unwrapped_res = accessor.apply(&[&x.as_dynamic()]).simplify();
-                Value::wrap(&unwrapped_res, dst_type)
-            });
+            loc_mem[dsts[0]].content = Some(
+                loc_mem[srcs[0]]
+                .content
+                .as_ref()
+                .expect(format!("{} is uninitialized or moved", srcs[0]).as_str())
+                .clone()
+                .map(|x| {
+                    let unwrapped_res = accessor.apply(&[&x.as_dynamic()]).simplify();
+                    Value::wrap(&unwrapped_res, dst_type)
+                })
+            );
             None
         }
         GetGlobal(mod_id, struct_id, type_params) => {
             let addr_val = loc_mem[srcs[0]].content.clone();
             let resource_id = new_resource_id(*mod_id, *struct_id, type_params.clone());
-            let branch_condition = glob_mem
-                .exists(&resource_id, &addr_val)
-                .to_branch_condition(loc_mem.get_ctx());
-            *loc_mem &= branch_condition.true_branch.clone();
-            *glob_mem &= branch_condition.true_branch;
+            let branch_condition = 
+                BranchCondition::from(
+                    glob_mem
+                    .exists(
+                        &resource_id, 
+                        addr_val.expect("accessing uninitialized or moved local")
+                    )
+                );
             let resource_moved_out = glob_mem.real_move_from_(
                 &resource_id,
-                &loc_mem[srcs[0]]
+                loc_mem[srcs[0]]
                     .content
+                    .as_ref()
+                    .expect(format!("{} is uninitialized or moved", srcs[0]).as_str())
                     .clone()
                     .map(|x| x.as_addr().unwrap().clone()),
                 datatypes,
             );
-            loc_mem[dsts[0]].content =
-                resource_moved_out.map(|x| Value::Struct(x.as_datatype().unwrap()));
+            loc_mem[dsts[0]].content = Some(
+                resource_moved_out.map(|x| Value::Struct(x.as_datatype().unwrap()))
+            );
             Some(branch_condition.false_branch)
         }
         // Builtins
@@ -403,18 +434,19 @@ fn operation<'ctx, 'env>(
                 }
             }
             let refs = loc_mem[srcs[0]].content.clone();
-            let ref_val = refs
-                .map(|x| match x {
-                    Value::Reference(loc) => {
-                        let root_ty = root_type(&loc_mem, loc.root.clone());
-                        let ref_ty =
-                            access_path_ty(root_ty.clone(), &loc.access_path, &datatypes.borrow());
-                        read_ref(&loc_mem, glob_mem.clone(), loc.clone(), &root_ty, datatypes.clone())
-                            .map(|x| Value::wrap(&x, &ref_ty.clone().unwrap()))
-                    }
-                    _ => unreachable!(),
-                })
-                .flatten();
+            let ref_val = todo!();
+            // refs
+            //     .map(|x| match x {
+            //         Value::Reference(loc) => {
+            //             let root_ty = root_type(&loc_mem, loc.root.clone());
+            //             let ref_ty =
+            //                 access_path_ty(root_ty.clone(), &loc.access_path, &datatypes.borrow());
+            //             read_ref(&loc_mem, glob_mem.clone(), loc.clone(), &root_ty, datatypes.clone())
+            //                 .map(|x| Value::wrap(&x, &ref_ty.clone().unwrap()))
+            //         }
+            //         _ => unreachable!(),
+            //     })
+            //     .flatten();
             loc_mem[dsts[0]].content = ref_val;
             None
         }
@@ -487,7 +519,7 @@ fn operation<'ctx, 'env>(
                             );
                             Value::wrap(&dyn_val, &root_ty)
                         });
-                        loc_mem[local_index].content = new_local_val;
+                        loc_mem[local_index].content = Some(new_local_val);
                         (loc_mem, glob_mem)
                     }
                     Root::Global(resource_id, addr) => {
@@ -511,49 +543,55 @@ fn operation<'ctx, 'env>(
                     }
                 }
             }
-
-            let res = loc_mem[srcs[0]]
-                .content
-                .clone()
-                .prod(&loc_mem[srcs[1]].content)
-                .map(|(ref_, val)| {
-                    if let Value::Reference(loc) = ref_ {
-                        write_ref(loc, val, loc_mem.clone(), glob_mem.clone(), datatypes.clone())
-                    } else {
-                        unreachable!()
-                    }
-                })
-                .0
-                .into_iter()
-                .map(
-                    |Constrained {
-                         content: (loc_mem, glob_mem),
-                         constraint,
-                     }| { (loc_mem & constraint.clone(), glob_mem & constraint) },
-                )
-                .fold(
-                    (
-                        LocalMemory {
-                            context: loc_mem.get_ctx(),
-                            locals: loc_mem
-                                .locals
-                                .iter()
-                                .map(|x| Local {
-                                    ty: x.ty.clone(),
-                                    content: Disjoints(Vec::new()),
-                                })
-                                .collect(),
-                        },
-                        GlobalMemory {
-                            ctx: glob_mem.ctx,
-                            resource_value: BTreeMap::new(),
-                            resource_existence: BTreeMap::new(),
-                        },
-                    ),
-                    |(loc_mem, glob_mem), (s_, t_)| (loc_mem.merge(s_), glob_mem.merge(t_)),
-                );
-            *loc_mem = res.0;
-            *glob_mem = res.1;
+            todo!();
+            // let res = loc_mem[srcs[0]]
+            //     .content
+            //     .expect(format!("{} uninitialized or moved", srcs[0]).as_str())
+            //     .clone()
+            //     .prod(
+            //         loc_mem[srcs[1]]
+            //         .content
+            //         .expect(format!("{} uninitialized or moved", srcs[1]).as_str())
+            //         .clone()
+            //     )
+            //     .map(|(ref_, val)| {
+            //         if let Value::Reference(loc) = ref_ {
+            //             write_ref(loc, val, loc_mem.clone(), glob_mem.clone(), datatypes.clone())
+            //         } else {
+            //             unreachable!()
+            //         }
+            //     })
+            //     .0
+            //     .into_iter()
+            //     .map(
+            //         |Constrained {
+            //              content: (loc_mem, glob_mem),
+            //              constraint,
+            //          }| { (loc_mem & constraint.clone(), glob_mem & constraint) },
+            //     )
+            //     .fold(
+            //         (
+            //             LocalMemory {
+            //                 context: loc_mem.get_ctx(),
+            //                 locals: loc_mem
+            //                     .locals
+            //                     .iter()
+            //                     .map(|x| Local {
+            //                         ty: x.ty.clone(),
+            //                         content: Disjoints(Vec::new()),
+            //                     })
+            //                     .collect(),
+            //             },
+            //             GlobalMemory {
+            //                 ctx: glob_mem.ctx,
+            //                 resource_value: BTreeMap::new(),
+            //                 resource_existence: BTreeMap::new(),
+            //             },
+            //         ),
+            //         |(loc_mem, glob_mem), (s_, t_)| (loc_mem.merge(s_), glob_mem.merge(t_)),
+            //     );
+            // *loc_mem = res.0;
+            // *glob_mem = res.1;
             None
         }
         // FreezeRef,
@@ -768,6 +806,22 @@ impl<'ctx> BranchCondition<'ctx> {
     pub fn simplify(self) -> Self {
         match self {
         BranchCondition { true_branch, false_branch } => BranchCondition { true_branch: true_branch.simplify(), false_branch: false_branch.simplify() }
+        }
+    }
+}
+
+impl<'ctx> From<SymbolicTree<OrderedConstraint<'ctx>, Constraint<'ctx>>> for BranchCondition<'ctx> {
+    fn from(t: SymbolicTree<OrderedConstraint<'ctx>, Constraint<'ctx>>) -> Self {
+        match t {
+            SymbolicTree::Node(v) => BranchCondition { true_branch: v.clone(), false_branch: !v.clone()},
+            SymbolicTree::Leaf(l, p, r) => {
+                let left_recur = BranchCondition::from(*l);
+                let right_recur = BranchCondition::from(*r);
+                BranchCondition {
+                    true_branch: left_recur.true_branch & &p.constraint| right_recur.true_branch & !&p.constraint,
+                    false_branch: left_recur.false_branch & &p.constraint | right_recur.false_branch & !p.constraint,
+                }
+            }
         }
     }
 }

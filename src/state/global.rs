@@ -58,7 +58,7 @@ impl<'ctx> GlobalMemory<'ctx> {
             &datatypes.borrow_mut().from_struct(&resource).sort,
         );
         self.resource_value
-            .insert(resource.clone(), SymbolicTree::pure(init_val)); // pure uses global ctx!!
+            .insert(resource.clone(), SymbolicTree::pure(init_val));
     }
 
     // Similar to `init_resource_value`.
@@ -132,15 +132,18 @@ impl<'ctx> GlobalMemory<'ctx> {
         match self.resource_value.get(resource_type) {
             Some(resource_value_maps) => {
                 let resource_vals = resource;
-                let new_resource_value_map = resource_value_maps
-                    .prod(addrs)
+                let new_resource_value_map = 
+                    resource_value_maps
+                    .clone()
+                    .prod(addrs.clone())
                     .prod(resource_vals)
                     .map(|((array, addr), resource_val)| array.store(&addr, &resource_val));
                 let resource_existence_map =
                     self.resource_existence.get(resource_type).unwrap(); // already inited when checking for existence
                 let new_resource_existence_map =
                     resource_existence_map
-                        .prod(addrs)
+                        .clone()
+                        .prod(addrs.clone())
                         .map(|(array, addr)| {
                             array.store(&addr, &Bool::from_bool(self.get_ctx(), true))
                         });
@@ -166,13 +169,19 @@ impl<'ctx> GlobalMemory<'ctx> {
         // update resource existence map so that addr contains true
         match self.resource_value.get(resource_type) {
             Some(resource_value_maps) => {
-                let ret_vals = resource_value_maps.prod(addrs).map(
-                    |(global_mem, addr)| global_mem.select(&addr)
-                );
+                let ret_vals = 
+                    resource_value_maps
+                    .clone()
+                    .prod(addrs.clone())
+                    .map(
+                        |(global_mem, addr)| global_mem.select(&addr)
+                    );
                 let resource_existence_map =
                     self.resource_existence.get(resource_type).unwrap(); // already inited when checking for existence
-                let new_resource_existence_map = resource_existence_map
-                    .prod(addrs)
+                let new_resource_existence_map = 
+                    resource_existence_map
+                    .clone()
+                    .prod(addrs.clone())
                     .map(|(array, addr)| array.store(&addr, &Bool::from_bool(self.get_ctx(), false)));
                 self.resource_existence
                     .insert(resource_type.clone(), new_resource_existence_map);
@@ -195,9 +204,13 @@ impl<'ctx> GlobalMemory<'ctx> {
         // update resource existence map so that addr contains true
         match self.resource_value.get(resource_type) {
             Some(resource_value_maps) => {
-                let ret_vals = resource_value_maps.prod(addrs).map(
-                    |(global_mem, addr)| global_mem.select(&addr)
-                );
+                let ret_vals = 
+                    resource_value_maps
+                    .clone()
+                    .prod(addrs)
+                    .map(
+                        |(global_mem, addr)| global_mem.select(&addr)
+                    );
                 ret_vals
             }
             None => {
