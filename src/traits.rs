@@ -34,7 +34,7 @@ pub trait Monoidal: Functor + Sized {
 //     }
 // }
 
-pub trait Applicative: Functor {
+pub trait Applicative: Functor + Sized {
     fn pure(x: Self::Source) -> Self;
 
     fn ap<B, F>(self, f: Self::Fb<F>) -> Self::Fb<B>
@@ -53,3 +53,12 @@ pub trait Applicative: Functor {
 //          .map(|(f, a)| f(a))    
 //     }
 // }
+
+pub trait Monad: Applicative {
+    fn ret(x: Self::Source) -> Self {
+        Self::pure(x)
+    }
+
+    fn bind<B, F>(self, f: F) -> Self::Fb<B>
+        where F: Fn(Self::Source) -> Self::Fb<B> + Clone;
+}
