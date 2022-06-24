@@ -62,3 +62,14 @@ pub trait Monad: Applicative {
     fn bind<B, F>(self, f: F) -> Self::Fb<B>
         where F: Fn(Self::Source) -> Self::Fb<B> + Clone;
 }
+
+pub trait Monoid {
+    fn mappend(self, other: Self) -> Self;
+}
+
+impl<T> Monoid for Vec<T> {
+    fn mappend(self, other: Self) -> Self {
+        self.append(&mut other);
+        self
+    }
+}
