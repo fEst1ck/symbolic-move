@@ -1,4 +1,4 @@
-use crate::traits::{Functor, Monoidal, Applicative};
+use crate::traits::{Functor, Monoidal, Applicative, Monad};
 
 pub enum SymbolicTree<OrderedConstraint: Ord, Val> {
     Node(Val),
@@ -73,6 +73,19 @@ impl<OrderedConstraint: Ord + Clone, Val: Clone> Clone for SymbolicTree<OrderedC
         match self {
             Node(v) => Node(v.clone()),
             Leaf(l, p, r) => Leaf(l.clone(), p.clone(), r.clone())
+        }
+    }
+}
+
+impl<OrderedConstraint: Ord + Clone, Val: Clone> Monad for SymbolicTree<OrderedConstraint, Val> {
+    fn bind<B, F>(self, f: F) -> Self::Fb<B>
+        where F: Fn(Self::Source) -> Self::Fb<B> + Clone
+    {
+        match self {
+            SymbolicTree::Node(v) => f(v),
+            SymbolicTree::Leaf(l, p, r) => {
+                SymbolicTree::Leaf(Box::new(l.bind(f.clone())), p, Box::new(r.bind(f.clone())))
+            }
         }
     }
 }
