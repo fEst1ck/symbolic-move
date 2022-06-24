@@ -1,4 +1,4 @@
-use crate::traits::{Functor, Monoidal, Applicative, Monad};
+use crate::traits::{Functor, Monoidal, Applicative, Monad, Monoid};
 
 pub enum SymbolicTree<OrderedConstraint: Ord, Val> {
     Node(Val),
@@ -78,6 +78,9 @@ impl<OrderedConstraint: Ord + Clone, Val: Clone> Clone for SymbolicTree<OrderedC
 }
 
 impl<OrderedConstraint: Ord + Clone, Val: Clone> Monad for SymbolicTree<OrderedConstraint, Val> {
+    /// This doesn't satisfy the law
+    /// `m1 <*> m2 = m1 >>= (x1 -> m2 >>= (x2 -> return (x1 x2)))`
+    /// but the two values are equivalent.
     fn bind<B, F>(self, f: F) -> Self::Fb<B>
         where F: Fn(Self::Source) -> Self::Fb<B> + Clone
     {
@@ -87,5 +90,13 @@ impl<OrderedConstraint: Ord + Clone, Val: Clone> Monad for SymbolicTree<OrderedC
                 SymbolicTree::Leaf(Box::new(l.bind(f.clone())), p, Box::new(r.bind(f.clone())))
             }
         }
+    }
+}
+
+impl<OrderedConstraint: Ord + Clone, Val: Clone + Monoid> Monoid for SymbolicTree<OrderedConstraint, Val> {
+    fn mappend(self, other: Self) -> Self {
+        // so this is inefficient!
+        // self.bind(|x| other.map(|y| x.mappend(y)))
+        self.lift_a2(other, |x, y| x.mappend(y))
     }
 }
